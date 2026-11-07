@@ -189,8 +189,44 @@ struct SshSession {
 }
 
 fn sftp_err(e: russh_sftp::client::error::Error) -> Error {
-    let m = e.to_string();
-    if m.to_lowercase().contains("permission") { Error::server(format!("Permission denied: {m}")) } else { Error::server(m) }
+    match e {
+        // "Permission denied: Permission denied" → "Permission denied"; bare
+        // "Failure" gets the usual reasons, since servers rarely say more.
+        russh_sftp::client::error::Error::Status(st) => {
+            let code = st.status_code.to_string();
+            let msg = st.error_message.trim();
+            let text = if msg.is_empty() || msg.eq_ignore_ascii_case(&code) { code.clone() } else { format!("{code}: {msg}") };
+            if code.eq_ignore_ascii_case("failure") && (msg.is_empty() || msg.eq_ignore_ascii_case("failure")) {
+                Error::server("The server refused the operation (the item may be in use, not empty, or not allowed for this user)")
+            } else {
+                Error::server(text)
+            }
+        }
+        other => Error::server(other.to_string()),
+    }
+}
+
+/// Delete a folder and everything in it. Symlinks are removed, not followed.
+fn remove_tree<'a>(sftp: &'a SftpSession, path: String, depth: usize) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64>> + Send + 'a>> {
+    Box::pin(async move {
+        if depth > 64 {
+            return Err(Error::invalid(format!("{path} is nested too deeply to delete here")));
+        }
+        let mut removed = 0;
+        let entries: Vec<_> = sftp.read_dir(path.clone()).await.map_err(sftp_err)?.filter(|e| e.file_name() != "." && e.file_name() != "..").collect();
+        for e in entries {
+            let child = join(&path, &e.file_name());
+            let m = e.metadata();
+            if m.is_dir() && !m.is_symlink() {
+                removed += remove_tree(sftp, child, depth + 1).await?;
+            } else {
+                sftp.remove_file(child).await.map_err(sftp_err)?;
+                removed += 1;
+            }
+        }
+        sftp.remove_dir(path).await.map_err(sftp_err)?;
+        Ok(removed)
+    })
 }
 
 /// Breadcrumbs for absolute paths: "/", "/a", "/a/b" (folders only).
@@ -242,14 +278,20 @@ impl SshSession {
         if self.read_only { Err(Error::invalid("Connection is read-only")) } else { Ok(()) }
     }
     async fn ls(&self, dir: &str) -> Result<Vec<(String, bool, u64, Option<std::time::SystemTime>)>> {
-        let rd = self.sftp()?.read_dir(dir).await.map_err(sftp_err)?;
-        let mut v: Vec<_> = rd
-            .filter(|e| e.file_name() != "." && e.file_name() != "..")
-            .map(|e| {
-                let m = e.metadata();
-                (e.file_name(), m.is_dir(), m.len(), m.modified().ok())
-            })
-            .collect();
+        let sftp = self.sftp()?;
+        let rd = sftp.read_dir(dir).await.map_err(sftp_err)?;
+        let mut v = Vec::new();
+        for e in rd.filter(|e| e.file_name() != "." && e.file_name() != "..") {
+            let mut m = e.metadata();
+            // readdir describes the link itself; show what it points to (a
+            // broken link stays a small file).
+            if m.is_symlink()
+                && let Ok(target) = sftp.metadata(join(dir, &e.file_name())).await
+            {
+                m = target;
+            }
+            v.push((e.file_name(), m.is_dir(), m.len(), m.modified().ok()));
+        }
         v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
         Ok(v)
     }
@@ -391,7 +433,7 @@ impl ResourceSession for SshSession {
                 ActionSpec::new("upload", "Upload file…").primary().field(FieldSpec::text("file", "File").kind(FieldKind::File { save: false, filters: &[] }).required()),
                 ActionSpec::new("mkdir", "New folder…").field(FieldSpec::text("name", "Name").required()),
                 ActionSpec::new("rename", "Rename…").field(FieldSpec::text("name", "New name").required()),
-                ActionSpec::new("rmdir", "Delete folder (must be empty)").destructive(),
+                ActionSpec::new("rmdir", "Delete folder and its contents").destructive(),
             ],
             "file" => vec![
                 ActionSpec::new("download", "Download…").primary().field(FieldSpec::text("file", "Save as").kind(FieldKind::File { save: true, filters: &[] }).required()),
@@ -414,12 +456,13 @@ impl ResourceSession for SshSession {
             "upload" => {
                 let local = std::path::PathBuf::from(arg(&a, "file")?);
                 let name = local.file_name().map(|f| f.to_string_lossy().into_owned()).ok_or_else(|| Error::invalid("Pick a file"))?;
-                let data = tokio::fs::read(&local).await.map_err(|e| Error::io(format!("{}: {e}", local.display())))?;
+                // Streamed, so large files do not have to fit in memory.
+                let mut src = tokio::fs::File::open(&local).await.map_err(|e| Error::io(format!("{}: {e}", local.display())))?;
                 let mut f = sftp.create(join(&path, &name)).await.map_err(sftp_err)?;
                 use tokio::io::AsyncWriteExt;
-                f.write_all(&data).await.map_err(|e| Error::io(e.to_string()))?;
+                let n = tokio::io::copy(&mut src, &mut f).await.map_err(|e| Error::io(format!("Upload of {name} failed: {e}")))?;
                 f.shutdown().await.map_err(|e| Error::io(e.to_string()))?;
-                Ok(ActionOutcome::msg(format!("Uploaded {name} ({})", openvclient_core::containers::human_bytes(data.len() as u64))).refresh(node.to_string()))
+                Ok(ActionOutcome::msg(format!("Uploaded {name} ({})", openvclient_core::containers::human_bytes(n))).refresh(node.to_string()))
             }
             "mkdir" => {
                 let name = arg(&a, "name")?.trim().to_string();
@@ -428,12 +471,22 @@ impl ResourceSession for SshSession {
             }
             "rename" => {
                 let to = join(&parent(&path), arg(&a, "name")?.trim());
+                // SFTP servers answer a clash with a bare "Failure"; say what it is.
+                if to != path && sftp.symlink_metadata(to.clone()).await.is_ok() {
+                    return Err(Error::invalid(format!("{} already exists in this folder", arg(&a, "name")?.trim())));
+                }
                 sftp.rename(path.clone(), to.clone()).await.map_err(sftp_err)?;
                 Ok(ActionOutcome::msg(format!("Renamed to {to}")).refresh(up))
             }
             "rmdir" => {
-                sftp.remove_dir(path.clone()).await.map_err(sftp_err)?;
-                Ok(ActionOutcome::msg(format!("Deleted {path}")).refresh(up))
+                // A symlink to a folder is removed as a link; its target is untouched.
+                if sftp.symlink_metadata(path.clone()).await.map(|m| m.is_symlink()).unwrap_or(false) {
+                    sftp.remove_file(path.clone()).await.map_err(sftp_err)?;
+                    return Ok(ActionOutcome::msg(format!("Deleted link {path}")).refresh(up));
+                }
+                let n = remove_tree(sftp, path.clone(), 0).await?;
+                let what = if n == 0 { String::new() } else { format!(" and {n} item{} inside", if n == 1 { "" } else { "s" }) };
+                Ok(ActionOutcome::msg(format!("Deleted {path}{what}")).refresh(up))
             }
             "rm" => {
                 sftp.remove_file(path.clone()).await.map_err(sftp_err)?;
@@ -452,9 +505,12 @@ impl ResourceSession for SshSession {
             }
             "download" => {
                 let local = std::path::PathBuf::from(arg(&a, "file")?);
-                let data = sftp.read(path.clone()).await.map_err(sftp_err)?;
-                tokio::fs::write(&local, &data).await.map_err(|e| Error::io(format!("{}: {e}", local.display())))?;
-                Ok(ActionOutcome::msg(format!("Saved {} to {}", openvclient_core::containers::human_bytes(data.len() as u64), local.display())))
+                let mut src = sftp.open(path.clone()).await.map_err(sftp_err)?;
+                let mut dst = tokio::fs::File::create(&local).await.map_err(|e| Error::io(format!("{}: {e}", local.display())))?;
+                let n = tokio::io::copy(&mut src, &mut dst).await.map_err(|e| Error::io(format!("Download failed: {e}")))?;
+                use tokio::io::AsyncWriteExt;
+                dst.flush().await.map_err(|e| Error::io(e.to_string()))?;
+                Ok(ActionOutcome::msg(format!("Saved {} to {}", openvclient_core::containers::human_bytes(n), local.display())))
             }
             other => Err(Error::unsupported(format!("Unknown action {other}"))),
         }
@@ -674,3 +730,7 @@ mod auth_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "ssh_lab_tests.rs"]
+mod ssh_lab_tests;

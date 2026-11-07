@@ -9,7 +9,7 @@ Rust + egui desktop app for managing databases and infrastructure. The workspace
 - Colours come from `theme::tokens(ui)` and icons from `egui_material_icons`. Never use raw hex values in views, and never use emoji as icons.
 
 ## Testing
-Connector tests run against live local servers and skip themselves when a server is unreachable. They need PostgreSQL on localhost, MySQL on 127.0.0.1 as root, and Redis on port 56379 (`docker run -d --rm --name openvclient-test-redis -p 56379:6379 redis:7-alpine`).
+Connector tests run against live local servers and skip themselves when a server is unreachable. SSH has its own lab covering every login method, key type, jump host, tunnel and SFTP edge case: `scripts/ssh-lab.sh up`, then `scripts/ssh-lab.sh test`, then `scripts/ssh-lab.sh down`. They need PostgreSQL on localhost, MySQL on 127.0.0.1 as root, and Redis on port 56379 (`docker run -d --rm --name openvclient-test-redis -p 56379:6379 redis:7-alpine`).
 
 ## Build and UI check
 - `./scripts/bundle-macos.sh` builds `dist/OpenVClient.app`: a release build with an ad-hoc signature.
