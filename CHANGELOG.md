@@ -4,6 +4,25 @@ All notable changes to OpenVClient are listed here. The project follows
 [Semantic Versioning](https://semver.org); pre-releases are tagged
 `vX.Y.Z-beta.N` and published as GitHub pre-releases.
 
+## [1.0.0-beta.5] — 2026-11-07
+
+Notes: [docs/release-notes/v1.0.0-beta.5.md](docs/release-notes/v1.0.0-beta.5.md).
+
+### Added
+- ER diagram and schema compare (PostgreSQL, MySQL/MariaDB, SQLite, SQL Server).
+- Charts from query results; SQL formatter (⌘⇧F); snippets; manual commit mode.
+- Session restore offer on Home; recent queries; Home grouped by folder.
+- Frozen grid columns; filter or exclude by a cell's value; recent WHERE filters.
+- Image and PDF previews, per-file transfer progress and folder item counts in the file manager.
+- Tab menu (close others / to the right / all, reopen closed), ⌘⇧T, ⌘1–9, ⌘B.
+- Connection URL paste; export and import of connections; interface size, query timeout, Staging confirmation, NULL label and timestamp settings.
+- SSH lab (`scripts/ssh-lab.sh`) with 45 checks against real OpenSSH servers.
+
+### Fixed
+- SSH: older servers (hmac-sha1, group14-sha1, CBC), key-and-password logins, passphrase errors, symlinks, folder delete, streamed transfers.
+- Wide results scroll sideways instead of cutting off columns.
+- Toasts, truncated names, file list alignment, tab titles and the plan diagram (see the notes).
+
 ## [1.0.0-beta.4] — 2026-11-06
 
 Notes: [docs/release-notes/v1.0.0-beta.4.md](docs/release-notes/v1.0.0-beta.4.md).
