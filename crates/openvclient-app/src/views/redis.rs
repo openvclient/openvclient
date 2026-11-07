@@ -331,6 +331,26 @@ impl RedisTab {
             let f = self.key_filter.to_lowercase();
             let keys: Vec<KeyEntry> = self.keys.iter().filter(|k| f.is_empty() || k.key.to_lowercase().contains(&f)).cloned().collect();
             let mut clicked = None;
+            // A clear empty state with a way forward, instead of a blank list.
+            if keys.is_empty() && self.scan.is_none() && self.scanned_once {
+                ui.add_space(theme::space::LG);
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new(String::from(ICON_KEY_OFF)).size(28.0).color(t.muted_fg));
+                    let msg = if !self.key_filter.is_empty() {
+                        "No loaded key matches the filter"
+                    } else if self.pattern.trim() != "*" && !self.pattern.trim().is_empty() {
+                        "No key matches this pattern"
+                    } else {
+                        "This database has no keys"
+                    };
+                    ui.label(RichText::new(msg).strong());
+                    ui.label(RichText::new("Try a pattern such as user:*, session:* or *:cache").small().color(t.muted_fg));
+                    ui.add_space(theme::space::SM);
+                    if ui.button(ico(ICON_ADD, "Add a key")).clicked() {
+                        self.new_key = Some((String::new(), "string", String::new(), String::new(), String::new()));
+                    }
+                });
+            }
             egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, 22.0, keys.len(), |ui, range| {
                 for k in &keys[range] {
                     ui.horizontal(|ui| {

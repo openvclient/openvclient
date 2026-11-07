@@ -354,9 +354,26 @@ pub async fn ssh_connect(host: &str, port: u16, user: &str, auth: &SshAuth, expe
     ssh_connect_via(None, &t, timeout).await
 }
 
+/// russh's safe defaults first, then older algorithms that routers, NAS boxes
+/// and CentOS 7-era servers still require (hmac-sha1, group14-sha1, CBC). They
+/// are only chosen when the server offers nothing better, and the negotiated
+/// lists are signed in the key exchange, so they cannot be forced on a modern
+/// server by someone in the middle.
+fn preferred_algorithms() -> russh::Preferred {
+    use std::borrow::Cow;
+    let d = russh::Preferred::DEFAULT;
+    let mut kex = d.kex.to_vec();
+    kex.extend([russh::kex::DH_GEX_SHA1, russh::kex::DH_G14_SHA1]);
+    let mut cipher = d.cipher.to_vec();
+    cipher.extend([russh::cipher::AES_128_GCM, russh::cipher::AES_256_CBC, russh::cipher::AES_192_CBC, russh::cipher::AES_128_CBC]);
+    let mut mac = d.mac.to_vec();
+    mac.extend([russh::mac::HMAC_SHA1_ETM, russh::mac::HMAC_SHA1]);
+    russh::Preferred { kex: Cow::Owned(kex), key: d.key, cipher: Cow::Owned(cipher), mac: Cow::Owned(mac), compression: d.compression }
+}
+
 /// Log in, optionally through a jump host (like OpenSSH ProxyJump).
 pub async fn ssh_connect_via(jump: Option<&client::Handle<HostKeyCheck>>, t: &SshTarget, timeout: Duration) -> Result<(client::Handle<HostKeyCheck>, String)> {
-    let config = Arc::new(client::Config { inactivity_timeout: None, keepalive_interval: Some(Duration::from_secs(30)), ..Default::default() });
+    let config = Arc::new(client::Config { inactivity_timeout: None, keepalive_interval: Some(Duration::from_secs(30)), preferred: preferred_algorithms(), ..Default::default() });
     let seen = Arc::new(std::sync::Mutex::new(None));
     let mismatch = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let unknown = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -398,7 +415,7 @@ pub async fn ssh_connect_via(jump: Option<&client::Handle<HostKeyCheck>>, t: &Ss
     let fingerprint = seen.lock().unwrap().clone().unwrap_or_default();
     let user = t.user.as_str();
     let ce = |e: russh::Error| Error::connection(e.to_string());
-    let load = |path: &std::path::Path, pass: Option<&str>| russh::keys::load_secret_key(path, pass).map_err(|e| Error::invalid(format!("Could not load private key {}: {e}", path.display())));
+    let load = |path: &std::path::Path, pass: Option<&str>| russh::keys::load_secret_key(path, pass).map_err(|e| key_error(&e.to_string(), &path.display().to_string(), pass.is_some()));
     // Methods the server said it accepts after a failed attempt, for the error message.
     let mut offered: Option<Vec<String>> = None;
     let ok = match &t.auth {
@@ -414,12 +431,18 @@ pub async fn ssh_connect_via(jump: Option<&client::Handle<HostKeyCheck>>, t: &Ss
         },
         SshAuth::KeyboardInteractive { password, otp } => keyboard_interactive(&mut session, user, password, otp.as_deref()).await?,
         SshAuth::Key { path, passphrase } => {
-            let key = load(path, passphrase.as_deref())?;
+            // An unencrypted key ignores the passphrase field, which then serves
+            // as the password for servers that want key AND password.
+            let key = match russh::keys::load_secret_key(path, None) {
+                Ok(k) => k,
+                Err(_) => load(path, passphrase.as_deref())?,
+            };
             let hash = session.best_supported_rsa_hash().await.map_err(ce)?.flatten();
-            session.authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key), hash)).await.map_err(ce)?.success()
+            let r = session.authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key), hash)).await.map_err(ce)?;
+            then_password(&mut session, user, r, passphrase.as_deref(), &mut offered).await?
         }
         SshAuth::KeyText { pem, passphrase } => {
-            let key = russh::keys::decode_secret_key(pem.trim(), passphrase.as_deref()).map_err(|e| Error::invalid(format!("Could not read the pasted private key: {e}")))?;
+            let key = russh::keys::decode_secret_key(pem.trim(), passphrase.as_deref()).map_err(|e| key_error(&e.to_string(), "the pasted key", passphrase.is_some()))?;
             let hash = session.best_supported_rsa_hash().await.map_err(ce)?.flatten();
             session.authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key), hash)).await.map_err(ce)?.success()
         }
@@ -438,6 +461,43 @@ pub async fn ssh_connect_via(jump: Option<&client::Handle<HostKeyCheck>>, t: &Ss
         return Err(Error::auth(format!("SSH authentication failed for {user}@{host} ({:?}){methods}", t.auth)));
     }
     Ok((session, fingerprint))
+}
+
+/// Second factor after an accepted key (`AuthenticationMethods publickey,password`):
+/// continue with password or keyboard-interactive using `password`.
+async fn then_password(session: &mut client::Handle<HostKeyCheck>, user: &str, r: russh::client::AuthResult, password: Option<&str>, offered: &mut Option<Vec<String>>) -> Result<bool> {
+    let ce = |e: russh::Error| Error::connection(e.to_string());
+    match r {
+        russh::client::AuthResult::Success => Ok(true),
+        russh::client::AuthResult::Failure { remaining_methods, partial_success } => {
+            *offered = Some(remaining_methods.iter().map(|m| <&str>::from(m).to_string()).collect());
+            if !partial_success {
+                return Ok(false);
+            }
+            let Some(pw) = password.filter(|p| !p.is_empty()) else {
+                return Err(Error::auth(format!("{user}: the key was accepted, but the server also wants a password. Type it in the Password / passphrase field.")));
+            };
+            if remaining_methods.contains(&russh::MethodKind::Password) {
+                Ok(session.authenticate_password(user, pw).await.map_err(ce)?.success())
+            } else if remaining_methods.contains(&russh::MethodKind::KeyboardInteractive) {
+                keyboard_interactive(session, user, pw, None).await
+            } else {
+                Ok(false)
+            }
+        }
+    }
+}
+
+/// A readable error for a private key that could not be opened.
+fn key_error(raw: &str, what: &str, had_passphrase: bool) -> Error {
+    let l = raw.to_lowercase();
+    if l.contains("encrypted") && !had_passphrase {
+        Error::auth(format!("The private key {what} is protected by a passphrase. Type it in the Password / passphrase field."))
+    } else if had_passphrase && (l.contains("crypto") || l.contains("decrypt") || l.contains("passphrase") || l.contains("mac")) {
+        Error::auth(format!("Wrong passphrase for the private key {what}."))
+    } else {
+        Error::invalid(format!("Could not read the private key {what}: {raw}. Use an OpenSSH, PEM or PKCS#8 private key (not the .pub file)."))
+    }
 }
 
 /// Keyboard-interactive login: password prompts get the password, other

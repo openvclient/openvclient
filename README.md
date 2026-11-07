@@ -15,7 +15,8 @@
   <a href="#screenshots">Screenshots</a> ·
   <a href="#features">Features</a> ·
   <a href="#supported-connectors">Connectors</a> ·
-  <a href="CONTRIBUTING.md">Contribute</a>
+  <a href="CONTRIBUTING.md">Contribute</a> ·
+  <a href="https://buymeacoffee.com/rohansirohi"><b>☕ Buy me a coffee</b></a>
 </p>
 
 <p align="center">
@@ -24,6 +25,7 @@
   <img alt="Platforms" src="https://img.shields.io/badge/macOS%20%C2%B7%20Windows%20%C2%B7%20Linux-1a1612">
   <img alt="Licence" src="https://img.shields.io/badge/licence-MIT%20or%20Apache--2.0-ffdb58">
   <img alt="Written in Rust" src="https://img.shields.io/badge/native-Rust%20%2B%20egui-4ecdc4">
+  <a href="https://buymeacoffee.com/rohansirohi"><img alt="Buy me a coffee" src="https://img.shields.io/badge/Buy%20me%20a%20coffee-support-ffdd00?logo=buymeacoffee&logoColor=000000"></a>
 </p>
 
 <p align="center">
@@ -319,6 +321,16 @@ Logs go to stderr and to `<config dir>/logs/openvclient.log`. The file is rotate
 To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ---
+
+## Support the project
+
+OpenVClient is free and open source, built and maintained by one person. If it saves you time, you can support its development:
+
+<p>
+  <a href="https://buymeacoffee.com/rohansirohi"><img alt="Buy me a coffee" src="https://img.shields.io/badge/Buy%20me%20a%20coffee-rohansirohi-ffdd00?style=for-the-badge&logo=buymeacoffee&logoColor=000000"></a>
+</p>
+
+Starring the repository, reporting bugs and sharing it with your team help just as much.
 
 ## Contributing
 

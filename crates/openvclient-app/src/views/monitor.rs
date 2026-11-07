@@ -160,8 +160,17 @@ impl MonitorTab {
                 Some(Ok(rs)) => {
                     let rs = rs.clone();
                     ui.label(RichText::new(format!("{} lock(s)", rs.rows.len())).color(t.muted_fg));
-                    Grid { id: egui::Id::unique(("locks", self.conn)), rs: &rs, editable: false, server_sort: None, overlay: Overlay::default(), generation: self.generation, row_offset: 0 }
-                        .show(ui, &mut self.lock_grid);
+                    Grid {
+                        id: egui::Id::unique(("locks", self.conn)),
+                        rs: &rs,
+                        editable: false,
+                        server_sort: None,
+                        overlay: Overlay::default(),
+                        generation: self.generation,
+                        row_offset: 0,
+                        server_filter: false,
+                    }
+                    .show(ui, &mut self.lock_grid);
                 }
             },
         }
@@ -184,7 +193,7 @@ impl MonitorTab {
                         let items: Vec<&Metric> = ms.iter().filter(|m| m.group == g).collect();
                         crate::widgets::cards::grid(ui, &items, 210.0, 84.0, |ui, m, resp| {
                             ui.add(egui::Label::new(RichText::new(&m.name).small().color(t.muted_fg)).truncate());
-                            ui.add(egui::Label::new(RichText::new(&m.value).size(18.0).strong()).truncate());
+                            ui.add(egui::Label::new(RichText::new(pretty_value(&m.value)).size(18.0).strong()).truncate()).on_hover_text(&m.value);
                             if let Some(h) = self.history.get(&format!("{}/{}", m.group, m.name)).filter(|h| h.len() > 1 && h.iter().any(|v| *v != h[0])) {
                                 sparkline(ui, h, t.info);
                             }
@@ -260,8 +269,17 @@ impl MonitorTab {
                 ui.label(RichText::new("Select a row to cancel or terminate it").color(t.muted_fg));
             }
         });
-        Grid { id: egui::Id::unique(("sessions", self.conn, self.hide_idle)), rs: &rs, editable: false, server_sort: None, overlay: Overlay::default(), generation: self.generation, row_offset: 0 }
-            .show(ui, &mut self.grid);
+        Grid {
+            id: egui::Id::unique(("sessions", self.conn, self.hide_idle)),
+            rs: &rs,
+            editable: false,
+            server_sort: None,
+            overlay: Overlay::default(),
+            generation: self.generation,
+            row_offset: 0,
+            server_filter: false,
+        }
+        .show(ui, &mut self.grid);
     }
 }
 
@@ -273,4 +291,40 @@ fn sparkline(ui: &mut egui::Ui, data: &VecDeque<f64>, color: egui::Color32) {
     let pts: Vec<egui::Pos2> =
         data.iter().enumerate().map(|(i, v)| egui::pos2(rect.left() + rect.width() * i as f32 / (n - 1) as f32, rect.bottom() - rect.height() * ((v - min) / span) as f32)).collect();
     ui.painter().add(egui::Shape::line(pts, egui::Stroke::new(1.5, color)));
+}
+
+/// Readable metric values: digit grouping for big integers, Yes/No for booleans.
+fn pretty_value(v: &str) -> String {
+    let t = v.trim();
+    match t {
+        "true" | "t" => return "Yes".into(),
+        "false" | "f" => return "No".into(),
+        _ => {}
+    }
+    if let Ok(n) = t.parse::<i64>()
+        && n.unsigned_abs() >= 10_000
+    {
+        let digits = n.unsigned_abs().to_string();
+        let mut out = String::new();
+        for (i, ch) in digits.chars().enumerate() {
+            if i > 0 && (digits.len() - i) % 3 == 0 {
+                out.push(',');
+            }
+            out.push(ch);
+        }
+        return if n < 0 { format!("-{out}") } else { out };
+    }
+    t.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn pretty_values() {
+        assert_eq!(super::pretty_value("20233239"), "20,233,239");
+        assert_eq!(super::pretty_value("9999"), "9999");
+        assert_eq!(super::pretty_value("false"), "No");
+        assert_eq!(super::pretty_value("99.97"), "99.97");
+        assert_eq!(super::pretty_value("-123456"), "-123,456");
+    }
 }

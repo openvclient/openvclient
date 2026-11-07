@@ -13,7 +13,8 @@ fn rel_detail(tuples: Option<&String>, size: Option<&String>) -> String {
         parts.push(format!("~{} rows", group_digits(t as u64)));
     }
     if let Some(s) = size {
-        parts.push(s.clone());
+        // Raw byte counts are formatted; anything else is shown as given.
+        parts.push(s.parse::<u64>().map(openvclient_core::containers::human_bytes).unwrap_or_else(|_| s.clone()));
     }
     parts.join(" · ")
 }
@@ -36,7 +37,7 @@ pub async fn children(s: &PgSession, node: Option<(ObjectKind, ObjPath)>) -> Res
             .text_rows(
                 None,
                 "SELECT datname::text, CASE WHEN has_database_privilege(datname, 'CONNECT') \
-                 THEN pg_size_pretty(pg_database_size(datname)) END, datallowconn::text \
+                 THEN pg_database_size(datname)::text END, datallowconn::text \
                  FROM pg_database WHERE NOT datistemplate ORDER BY datname",
                 &[],
             )
@@ -45,7 +46,8 @@ pub async fn children(s: &PgSession, node: Option<(ObjectKind, ObjPath)>) -> Res
             .into_iter()
             .map(|r| {
                 let name = r[0].clone().unwrap_or_default();
-                let mut detail = r[1].clone().unwrap_or_default();
+                // Sizes in bytes, formatted like every other connector (KiB/MiB/GiB).
+                let mut detail = r[1].as_deref().and_then(|b| b.parse::<u64>().ok()).map(openvclient_core::containers::human_bytes).unwrap_or_default();
                 if r[2].as_deref() == Some("false") {
                     detail = format!("connections disabled {detail}");
                 }
@@ -101,7 +103,7 @@ pub async fn children(s: &PgSession, node: Option<(ObjectKind, ObjPath)>) -> Res
             // relispartition exists from PostgreSQL 10; openGauss and Kingbase report older versions.
             let partitions = if s.version_num() >= 100000 { "AND NOT c.relispartition" } else { "" };
             let sql = format!(
-                "SELECT c.relname::text, c.reltuples::bigint::text, pg_size_pretty(pg_total_relation_size(c.oid)), c.relkind::text \
+                "SELECT c.relname::text, c.reltuples::bigint::text, pg_total_relation_size(c.oid)::text, c.relkind::text \
                  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
                  WHERE n.nspname = $1 AND c.relkind IN ({kinds}) {partitions} ORDER BY c.relname"
             );

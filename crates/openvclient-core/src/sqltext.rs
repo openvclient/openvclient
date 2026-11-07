@@ -912,3 +912,237 @@ mod dump_tests {
         assert_eq!(dangerous_dump_line("INSERT INTO t VALUES ('system');\n", DumpClient::Mysql), None);
     }
 }
+
+/// Reformat SQL for reading: upper-case keywords, one clause per line,
+/// one select-list item per line, AND/OR conditions on their own lines,
+/// subqueries indented. Strings, quoted names and comments are kept as
+/// written. Formatting never changes what the statement does.
+pub fn format_sql(dialect: Dialect, sql: &str) -> String {
+    const CLAUSES: [&str; 22] = [
+        "SELECT",
+        "FROM",
+        "WHERE",
+        "HAVING",
+        "LIMIT",
+        "OFFSET",
+        "UNION",
+        "INTERSECT",
+        "EXCEPT",
+        "VALUES",
+        "SET",
+        "RETURNING",
+        "WITH",
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "JOIN",
+        "LEFT",
+        "RIGHT",
+        "INNER",
+        "FULL",
+        "CROSS",
+    ];
+    let toks: Vec<(TokenKind, Span)> = tokenize(dialect, sql).into_iter().filter(|(k, _)| *k != TokenKind::Whitespace).collect();
+    let text = |i: usize| &sql[toks[i].1.start..toks[i].1.end];
+    let upper = |i: usize| text(i).to_ascii_uppercase();
+    let mut out = String::with_capacity(sql.len() + sql.len() / 4);
+    let mut depth: usize = 0;
+    // Per paren level: does it hold a subquery, and which clause is current?
+    let mut sub: Vec<bool> = vec![true];
+    let mut clause: Vec<String> = vec![String::new()];
+    let newline = |out: &mut String, indent: usize| {
+        while out.ends_with(' ') {
+            out.pop();
+        }
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&"  ".repeat(indent));
+    };
+    let mut prev_kw = String::new();
+    for i in 0..toks.len() {
+        let (kind, _) = toks[i];
+        let t = text(i);
+        let u = upper(i);
+        let in_sub = *sub.last().unwrap_or(&true);
+        let base = sub.iter().filter(|s| **s).count().saturating_sub(1);
+        match kind {
+            TokenKind::Comment => {
+                if !out.is_empty() && !out.ends_with('\n') && !out.ends_with(' ') {
+                    out.push(' ');
+                }
+                out.push_str(t.trim_end());
+                if t.starts_with("--") || t.starts_with('#') {
+                    newline(&mut out, base + 1);
+                }
+                continue;
+            }
+            TokenKind::Keyword if in_sub => {
+                let joins_after_modifier = u == "JOIN" && matches!(prev_kw.as_str(), "LEFT" | "RIGHT" | "INNER" | "FULL" | "CROSS" | "OUTER" | "NATURAL");
+                let is_clause = (CLAUSES.contains(&u.as_str()) && !joins_after_modifier)
+                    || ((u == "GROUP" || u == "ORDER") && i + 1 < toks.len() && upper(i + 1) == "BY")
+                    || (u == "INTO" && prev_kw != "INSERT")
+                    || u == "NATURAL";
+                // ON CONFLICT / DELETE in a trigger or rule clause stay inline after ON.
+                let after_on = prev_kw == "ON" || prev_kw == "DO";
+                if is_clause && !after_on && !(u == "SET" && prev_kw == "UPDATE" && false) {
+                    newline(&mut out, base);
+                    out.push_str(&u);
+                    out.push(' ');
+                    if let Some(c) = clause.last_mut() {
+                        *c = if u == "ORDER" || u == "GROUP" { format!("{u} BY") } else { u.clone() };
+                    }
+                    prev_kw = u;
+                    continue;
+                }
+                if (u == "AND" || u == "OR") && matches!(clause.last().map(String::as_str), Some("WHERE" | "HAVING" | "JOIN" | "LEFT" | "RIGHT" | "INNER" | "FULL" | "CROSS")) {
+                    newline(&mut out, base + 1);
+                    out.push_str(&u);
+                    out.push(' ');
+                    prev_kw = u;
+                    continue;
+                }
+                if !out.is_empty() && !out.ends_with(['\n', ' ', '(', '.']) {
+                    out.push(' ');
+                }
+                out.push_str(&u);
+                out.push(' ');
+                prev_kw = u;
+                continue;
+            }
+            TokenKind::Keyword => {
+                if !out.is_empty() && !out.ends_with(['\n', ' ', '(', '.']) {
+                    out.push(' ');
+                }
+                out.push_str(&u);
+                out.push(' ');
+                prev_kw = u;
+                continue;
+            }
+            _ => {}
+        }
+        match t {
+            "(" => {
+                // A paren opening a subquery indents what follows.
+                let opens_sub = i + 1 < toks.len() && matches!(upper(i + 1).as_str(), "SELECT" | "WITH");
+                // `count(` hugs its function name; `IN (`, `VALUES (` keep a space.
+                let after_kw = i > 0
+                    && toks[i - 1].0 == TokenKind::Keyword
+                    && !matches!(
+                        upper(i - 1).as_str(),
+                        "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" | "COALESCE" | "CAST" | "ROUND" | "LOWER" | "UPPER" | "NOW" | "EXISTS" | "SUBSTRING" | "TRIM" | "REPLACE" | "LENGTH" | "CONCAT"
+                    );
+                if after_kw {
+                    if !out.ends_with([' ', '\n', '(']) {
+                        out.push(' ');
+                    }
+                } else {
+                    while out.ends_with(' ') {
+                        out.pop();
+                    }
+                }
+                out.push('(');
+                depth += 1;
+                sub.push(opens_sub);
+                clause.push(String::new());
+            }
+            ")" => {
+                let was_sub = sub.pop().unwrap_or(false);
+                clause.pop();
+                depth = depth.saturating_sub(1);
+                if was_sub {
+                    newline(&mut out, sub.iter().filter(|s| **s).count().saturating_sub(1) + 1);
+                    while out.ends_with(' ') && out.ends_with("  ") {
+                        out.pop();
+                        out.pop();
+                    }
+                } else {
+                    while out.ends_with(' ') {
+                        out.pop();
+                    }
+                }
+                out.push_str(") ");
+            }
+            "," => {
+                while out.ends_with(' ') {
+                    out.pop();
+                }
+                out.push(',');
+                let list = matches!(clause.last().map(String::as_str), Some("SELECT" | "GROUP BY" | "ORDER BY" | "SET" | "RETURNING"));
+                if in_sub && list {
+                    newline(&mut out, base + 1);
+                } else {
+                    out.push(' ');
+                }
+            }
+            ";" => {
+                while out.ends_with(' ') {
+                    out.pop();
+                }
+                out.push_str(";\n\n");
+                depth = 0;
+                sub = vec![true];
+                clause = vec![String::new()];
+                prev_kw.clear();
+            }
+            "." => {
+                while out.ends_with(' ') {
+                    out.pop();
+                }
+                out.push('.');
+            }
+            ":" if out.ends_with(':') => out.push(':'),
+            _ => {
+                if out.ends_with(':') && kind == TokenKind::Ident && out.ends_with("::") {
+                    out.push_str(t);
+                } else {
+                    if !out.is_empty() && !out.ends_with(['\n', ' ', '(', '.']) {
+                        out.push(' ');
+                    }
+                    out.push_str(t);
+                    if !(kind == TokenKind::Operator && t == ":") {
+                        out.push(' ');
+                    }
+                }
+            }
+        }
+        let _ = depth;
+        // Only keywords that directly precede a clause should affect it.
+        prev_kw.clear();
+    }
+    let lines: Vec<String> = out.lines().map(|l| l.trim_end().to_string()).collect();
+    let mut s = lines.join("\n").trim().to_string();
+    while s.contains("\n\n\n") {
+        s = s.replace("\n\n\n", "\n\n");
+    }
+    s
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    #[test]
+    fn formats_a_select() {
+        let got = format_sql(
+            Dialect::Postgres,
+            "select c.country, count(*) as orders from sales.orders o join sales.customers c on c.id = o.customer_id where o.status = 'shipped' and o.amount > 10 group by 1 order by orders desc;",
+        );
+        let want = "SELECT c.country,\n  count(*) AS orders\nFROM sales.orders o\nJOIN sales.customers c ON c.id = o.customer_id\nWHERE o.status = 'shipped'\n  AND o.amount > 10\nGROUP BY 1\nORDER BY orders DESC;";
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn keeps_strings_and_comments() {
+        let got = format_sql(Dialect::Postgres, "-- top\nselect 'from where' as x, \"Select\" from t");
+        assert!(got.starts_with("-- top\nSELECT 'from where' AS x,"), "{got}");
+        assert!(got.contains("\"Select\""));
+    }
+
+    #[test]
+    fn indents_subqueries_and_left_join() {
+        let got = format_sql(Dialect::MySql, "select * from a left join b on a.id=b.id where a.id in (select id from c where x=1)");
+        assert!(got.contains("\nLEFT JOIN b ON a.id = b.id"), "{got}");
+        assert!(got.contains("IN (\n  SELECT id"), "{got}");
+    }
+}

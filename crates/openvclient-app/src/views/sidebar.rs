@@ -236,19 +236,23 @@ fn row_with_trailing(
     x += 22.0;
     let right = rect.right() - 6.0 - trailing;
     let max_w = right - x;
-    let galley = ui.painter().layout(label.to_string(), font.clone(), t.fg, f32::INFINITY);
-    let lw = galley.size().x.min(max_w);
-    ui.painter().with_clip_rect(rect.intersect(egui::Rect::from_min_max(egui::pos2(x, rect.top()), egui::pos2(x + max_w, rect.bottom())))).galley(
-        egui::pos2(x, cy - galley.size().y / 2.0),
-        galley,
-        t.fg,
-    );
+    let galley = elided(ui, label, font.clone(), t.fg, max_w);
+    let lw = galley.size().x;
+    ui.painter().galley(egui::pos2(x, cy - galley.size().y / 2.0), galley, t.fg);
     if !detail.is_empty() && lw + 40.0 < max_w {
         let dx = x + lw + 8.0;
-        let clip = egui::Rect::from_min_max(egui::pos2(dx, rect.top()), egui::pos2(right, rect.bottom()));
-        ui.painter().with_clip_rect(clip).text(egui::pos2(dx, cy), egui::Align2::LEFT_CENTER, detail, egui::FontId::proportional(12.0), t.muted_fg);
+        let g = elided(ui, detail, egui::FontId::proportional(12.0), t.muted_fg, right - dx);
+        ui.painter().galley(egui::pos2(dx, cy - g.size().y / 2.0), g, t.muted_fg);
     }
     resp.on_hover_text(if detail.is_empty() { label.to_string() } else { format!("{label}\n{detail}") })
+}
+
+/// One line of text cut to `max_w` with a trailing "…", so clipped text is
+/// always visibly shortened rather than sliced mid-glyph.
+pub(crate) fn elided(ui: &egui::Ui, text: &str, font: egui::FontId, color: egui::Color32, max_w: f32) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), font, color);
+    job.wrap = egui::text::TextWrapping { max_width: max_w.max(0.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+    ui.painter().layout_job(job)
 }
 
 fn connection_row(ui: &mut egui::Ui, cx: &mut AppCtx, p: &ConnectionProfile, indent: f32, filter: &str) {
@@ -589,6 +593,16 @@ fn object_menu(ui: &mut egui::Ui, cx: &mut AppCtx, id: Uuid, n: &TreeNode) {
     }
     match n.kind {
         ObjectKind::Database => {
+            if d == openvclient_core::sqltext::Dialect::MySql {
+                if ui.button(ico(ICON_SCHEMA, "ER diagram")).clicked() {
+                    cx.cmd(Cmd::OpenErd { conn: id, database: n.path.database.clone(), schema: n.label.clone() });
+                    ui.close();
+                }
+                if ui.button(ico(ICON_COMPARE_ARROWS, "Compare with…")).clicked() {
+                    cx.cmd(Cmd::OpenCompare { conn: id, database: n.path.database.clone(), schema: n.label.clone() });
+                    ui.close();
+                }
+            }
             if ui.button(ico(ICON_CODE, "New SQL editor")).clicked() {
                 cx.cmd(Cmd::NewSql { conn: id, database: n.path.database.clone(), text: String::new() });
                 ui.close();
@@ -651,6 +665,14 @@ fn object_menu(ui: &mut egui::Ui, cx: &mut AppCtx, id: Uuid, n: &TreeNode) {
             }
         }
         ObjectKind::Schema => {
+            if ui.button(ico(ICON_SCHEMA, "ER diagram")).clicked() {
+                cx.cmd(Cmd::OpenErd { conn: id, database: n.path.database.clone(), schema: n.label.clone() });
+                ui.close();
+            }
+            if ui.button(ico(ICON_COMPARE_ARROWS, "Compare with…")).clicked() {
+                cx.cmd(Cmd::OpenCompare { conn: id, database: n.path.database.clone(), schema: n.label.clone() });
+                ui.close();
+            }
             if ui.button(ico(ICON_CODE, "New SQL editor")).clicked() {
                 let text = if d == openvclient_core::sqltext::Dialect::Postgres { format!("SET search_path TO {};\n\n", d.quote_ident(&n.label)) } else { String::new() };
                 cx.cmd(Cmd::NewSql { conn: id, database: n.path.database.clone(), text });

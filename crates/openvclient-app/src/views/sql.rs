@@ -42,6 +42,17 @@ pub struct SqlTab {
     dialect: Dialect,
     run: Option<Job<Vec<StatementResult>>>,
     running_sql: Vec<String>,
+    /// When the current run started (for the Settings query timeout).
+    run_started: Option<std::time::Instant>,
+    /// Manual transactions: statements run inside BEGIN … COMMIT/ROLLBACK.
+    manual_tx: bool,
+    /// A transaction is open on this tab's session.
+    in_tx: bool,
+    /// Name typed in the "Save as snippet" box.
+    snippet_name: String,
+    /// Results shown as a chart instead of the grid.
+    chart_view: bool,
+    chart: crate::widgets::chart::ChartState,
     results: Vec<StatementResult>,
     grids: Vec<GridState>,
     active: usize,
@@ -85,6 +96,12 @@ impl SqlTab {
             dialect,
             run: None,
             running_sql: Vec::new(),
+            run_started: None,
+            manual_tx: false,
+            in_tx: false,
+            snippet_name: String::new(),
+            chart_view: false,
+            chart: Default::default(),
             results: Vec::new(),
             grids: Vec::new(),
             active: 0,
@@ -102,11 +119,120 @@ impl SqlTab {
         }
     }
 
+    #[cfg(test)]
+    pub fn test_format_and_chart(&mut self, cx: &mut AppCtx, format: bool, chart: bool) {
+        if format {
+            self.format(cx);
+        }
+        self.chart_view = chart;
+    }
+
+    /// Reformat the selection, or the whole editor when nothing is selected.
+    fn format(&mut self, cx: &mut AppCtx) {
+        let sel = self.last_selection.filter(|(a, b)| a < b && *b <= self.text.len() && self.text.is_char_boundary(*a) && self.text.is_char_boundary(*b));
+        let (a, b) = sel.unwrap_or((0, self.text.len()));
+        let formatted = openvclient_core::sqltext::format_sql(self.dialect, &self.text[a..b]);
+        if formatted.trim().is_empty() {
+            return;
+        }
+        if formatted != self.text[a..b] {
+            self.text.replace_range(a..b, &formatted);
+            self.dirty = true;
+            self.last_cursor = Some(a + formatted.len());
+            self.last_selection = None;
+        } else {
+            cx.toasts.ok("Already formatted");
+        }
+    }
+
+    fn snippets_menu(&mut self, ui: &mut egui::Ui, cx: &mut AppCtx, compact: bool) {
+        let n = cx.store.ws.snippets.len();
+        let title = if n > 0 { format!("Snippets ({n})") } else { "Snippets".to_string() };
+        let label = if compact { String::from(ICON_BOOKMARKS) } else { ico(ICON_BOOKMARKS, &title) };
+        ui.menu_button(label, |ui| {
+            ui.set_min_width(300.0);
+            ui.label(RichText::new("Save the editor (or selection) as a snippet").small().color(theme::muted(ui)));
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.snippet_name).hint_text("Snippet name").desired_width(200.0));
+                let sel = self.last_selection.filter(|(a, b)| a < b && *b <= self.text.len() && self.text.is_char_boundary(*a) && self.text.is_char_boundary(*b));
+                let body = match sel {
+                    Some((a, b)) => self.text[a..b].to_string(),
+                    None => self.text.clone(),
+                };
+                if ui.add_enabled(!self.snippet_name.trim().is_empty() && !body.trim().is_empty(), egui::Button::new("Save")).clicked() {
+                    let name = self.snippet_name.trim().to_string();
+                    cx.store.ws.snippets.retain(|s| s.name != name);
+                    cx.store.ws.snippets.push(crate::store::Snippet { name: name.clone(), sql: body.trim().to_string() });
+                    cx.store.ws.snippets.sort_by_key(|a| a.name.to_lowercase());
+                    cx.mark_dirty();
+                    cx.toasts.ok(format!("Saved snippet {name}"));
+                    self.snippet_name.clear();
+                }
+            });
+            if n == 0 {
+                ui.label(RichText::new("No snippets yet.").color(theme::muted(ui)));
+                return;
+            }
+            ui.separator();
+            let mut remove = None;
+            for (i, sn) in cx.store.ws.snippets.clone().iter().enumerate() {
+                ui.horizontal(|ui| {
+                    let first = sn.sql.lines().next().unwrap_or("");
+                    if ui.button(RichText::new(&sn.name).strong()).on_hover_text(&sn.sql).clicked() {
+                        // Insert at the cursor (replacing a selection).
+                        let at = self
+                            .last_selection
+                            .or(self.last_cursor.map(|c| (c, c)))
+                            .filter(|(a, b)| *b <= self.text.len() && self.text.is_char_boundary(*a) && self.text.is_char_boundary(*b))
+                            .unwrap_or((self.text.len(), self.text.len()));
+                        let mut ins = sn.sql.clone();
+                        if at.0 > 0 && !self.text[..at.0].ends_with('\n') {
+                            ins = format!("\n{ins}");
+                        }
+                        self.text.replace_range(at.0..at.1, &ins);
+                        self.last_cursor = Some(at.0 + ins.len());
+                        self.last_selection = None;
+                        self.dirty = true;
+                        ui.close();
+                    }
+                    ui.add(egui::Label::new(RichText::new(first).monospace().small().color(theme::muted(ui))).truncate());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button(String::from(ICON_DELETE)).on_hover_text("Delete snippet").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                });
+            }
+            if let Some(i) = remove {
+                cx.store.ws.snippets.remove(i);
+                cx.mark_dirty();
+            }
+        });
+    }
+
+    /// 1-based line and column of the cursor, plus selected characters.
+    pub fn cursor_position(&self) -> Option<(usize, usize, usize)> {
+        let c = self.last_cursor.filter(|c| *c <= self.text.len() && self.text.is_char_boundary(*c))?;
+        let before = &self.text[..c];
+        let line = before.matches('\n').count() + 1;
+        let col = before.rsplit('\n').next().map(|l| l.chars().count()).unwrap_or(0) + 1;
+        let sel =
+            self.last_selection.filter(|(a, b)| *b <= self.text.len() && self.text.is_char_boundary(*a) && self.text.is_char_boundary(*b)).map(|(a, b)| self.text[a..b].chars().count()).unwrap_or(0);
+        Some((line, col, sel))
+    }
+
+    /// Database and text, for reopening a closed tab.
+    pub fn reopen_parts(&self) -> (Option<String>, String) {
+        (self.database.clone(), self.text.clone())
+    }
+
     pub fn title(&self, conn_name: &str) -> String {
         if let Some(f) = &self.file {
             return f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         }
         match &self.database {
+            // Connections are often named after their database; do not say it twice.
+            Some(d) if conn_name == d || conn_name.ends_with(&format!(" · {d}")) || conn_name.ends_with(&format!(" {d}")) => conn_name.to_string(),
             Some(d) => format!("{conn_name} · {d}"),
             None => format!("{conn_name} · console {}", self.n),
         }
@@ -174,9 +300,16 @@ impl SqlTab {
             return;
         }
         let max = cx.store.ws.settings.max_rows;
+        let mut stmts = stmts;
+        // Manual transaction mode: open one before the first statement.
+        if self.manual_tx && !self.in_tx && !is_tx_control(&stmts[0]) {
+            stmts.insert(0, tx_sql(self.dialect, "BEGIN"));
+            self.in_tx = true;
+        }
         self.running_sql = stmts.clone();
         let n = stmts.len();
         self.run = Some(cx.bg.spawn(format!("Running {n} statement{}", if n == 1 { "" } else { "s" }), async move { c.execute(stmts, ExecOptions { max_rows: max }).await }));
+        self.run_started = Some(std::time::Instant::now());
         self.pane = Pane::Results;
     }
 
@@ -198,7 +331,17 @@ impl SqlTab {
                 Err(e) => Console::Failed(e),
             };
         }
-        if let Some(res) = poll(&mut self.run) {
+        if let Some(mut res) = poll(&mut self.run) {
+            // The BEGIN we added is bookkeeping, not a result worth a tab.
+            if res.len() > 1 && res[0].outcome.is_ok() && res[0].sql == tx_sql(self.dialect, "BEGIN") {
+                res.remove(0);
+            }
+            if let Some(last) = res.last()
+                && last.outcome.is_ok()
+                && matches!(leading_keyword(&last.sql).as_str(), "COMMIT" | "ROLLBACK" | "END")
+            {
+                self.in_tx = false;
+            }
             for r in &res {
                 cx.store.push_history(self.conn, &r.sql, r.outcome.is_ok());
             }
@@ -222,10 +365,25 @@ impl SqlTab {
             self.plan_view = Default::default();
         }
         let running = self.run.is_some();
+        // Settings → Query timeout: cancel runs that take too long.
+        let limit = cx.store.ws.settings.query_timeout_secs;
+        if running
+            && limit > 0
+            && self.run_started.is_some_and(|t| t.elapsed().as_secs() >= limit)
+            && let Some(c) = self.console()
+        {
+            c.cancel();
+            self.run_started = None;
+            cx.toasts.warn("Query cancelled", format!("It ran longer than the {limit} s timeout set in Settings."));
+        }
+        if running && limit > 0 {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+        }
         let caps = cx.conns.session(self.conn).and_then(|h| h.sql()).map(|s| s.capabilities()).unwrap_or_default();
 
         // Shortcuts apply only while this tab is focused.
         let focused = ui.ui_contains_pointer() || ui.memory(|m| m.has_focus(egui::Id::unique(("sqleditor", tab_id))));
+        let format_now = focused && ui.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::F)));
         let (run_one, run_all, explain, cancel, save, refresh) = if focused {
             ui.input_mut(|i| {
                 (
@@ -243,7 +401,9 @@ impl SqlTab {
 
         let mut want: Option<(bool, bool)> = None; // (all, explain)
         let mut want_analyze = false;
-        // Toolbar.
+        // Toolbar. Narrow windows get icon-only secondary buttons (labels in tooltips).
+        let compact = ui.available_width() < 1150.0;
+        let lab = |icon: egui_material_icons::MaterialIcon, text: &str| if compact { String::from(icon) } else { ico(icon, text) };
         ui.horizontal(|ui| {
             if running {
                 if theme::danger_button(ui, ico(ICON_STOP, &theme::kbd("Cancel  ⌘."))).clicked()
@@ -262,15 +422,18 @@ impl SqlTab {
                 if theme::primary_button(ui, ico(ICON_PLAY_ARROW, label)).on_hover_text(theme::kbd(tip)).clicked() {
                     want = Some((false, false));
                 }
-                if ui.button(ico(ICON_PLAYLIST_PLAY, "Run all")).on_hover_text(theme::kbd("Whole script (⌘⇧⏎)")).clicked() {
+                if ui.button(lab(ICON_PLAYLIST_PLAY, "Run all")).on_hover_text(theme::kbd("Whole script (⌘⇧⏎)")).clicked() {
                     want = Some((true, false));
                 }
             }
-            if caps.explain && ui.add_enabled(!running, egui::Button::new(ico(ICON_ACCOUNT_TREE, "Explain"))).on_hover_text(theme::kbd("Query plan for the statement at cursor (⌘E)")).clicked() {
+            if caps.explain && ui.add_enabled(!running, egui::Button::new(lab(ICON_ACCOUNT_TREE, "Explain"))).on_hover_text(theme::kbd("Query plan for the statement at cursor (⌘E)")).clicked() {
                 want = Some((false, true));
             }
             if caps.explain_analyze
-                && ui.add_enabled(!running, egui::Button::new(ico(ICON_SPEED, "Analyze"))).on_hover_text("EXPLAIN ANALYZE: executes the statement; data changes are rolled back").clicked()
+                && ui
+                    .add_enabled(!running, egui::Button::new(lab(ICON_SPEED, "Analyze")))
+                    .on_hover_text("EXPLAIN ANALYZE runs the statement for real timings. Data changes are rolled back where the engine allows it; do not analyze writes on production.")
+                    .clicked()
             {
                 want_analyze = true;
             }
@@ -290,6 +453,32 @@ impl SqlTab {
             if ui.button(String::from(ICON_SAVE)).on_hover_text(theme::kbd("Save (⌘S)")).clicked() {
                 self.save(cx, false);
             }
+            ui.separator();
+            if ui.add_enabled(!running, egui::Button::new(lab(ICON_FORMAT_ALIGN_LEFT, "Format"))).on_hover_text(theme::kbd("Tidy the SQL, or just the selection (⌘⇧F)")).clicked()
+                || (format_now && !running)
+            {
+                self.format(cx);
+            }
+            self.snippets_menu(ui, cx, compact);
+            // Transaction control.
+            if self.in_tx {
+                ui.label(RichText::new(lab(ICON_PENDING, "Transaction open")).color(t.warning)).on_hover_text("Changes are not visible to others until you commit");
+                if ui.add_enabled(!running, egui::Button::new(ico(ICON_CHECK, "Commit"))).clicked() {
+                    self.start(cx, vec![tx_sql(self.dialect, "COMMIT")], true);
+                }
+                if ui.add_enabled(!running, egui::Button::new(ico(ICON_UNDO, "Rollback"))).clicked() {
+                    self.start(cx, vec![tx_sql(self.dialect, "ROLLBACK")], true);
+                }
+            } else {
+                let (label, tip) = if self.manual_tx {
+                    ("Manual commit", "Statements run in a transaction; Commit or Roll back when done. Click for auto-commit.")
+                } else {
+                    ("Auto-commit", "Each statement is saved as soon as it runs. Click for manual transactions.")
+                };
+                if ui.selectable_label(self.manual_tx, lab(if self.manual_tx { ICON_LOCK } else { ICON_BOLT }, label)).on_hover_text(format!("{label}: {tip}")).clicked() {
+                    self.manual_tx = !self.manual_tx;
+                }
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 match &self.console {
                     Console::Ready(c) => {
@@ -305,7 +494,7 @@ impl SqlTab {
                     }
                 }
                 if let Some(p) = cx.store.profile(self.conn) {
-                    theme::badge(ui, p.environment.short(), theme::env_color(ui, p.environment));
+                    theme::badge(ui, p.environment.short(), theme::env_color(ui, p.environment)).on_hover_text(crate::views::env_tip(p.environment));
                 }
             });
         });
@@ -502,6 +691,13 @@ impl SqlTab {
                                 theme::badge(ui, "LIMITED", t.warning).on_hover_text(format!("Only the first {} rows were kept (Settings → Max rows).", rs.rows.len()));
                             }
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let chartable = !crate::widgets::chart::numeric_columns(&rs).is_empty();
+                                if chartable {
+                                    ui.selectable_value(&mut self.chart_view, true, ico(ICON_BAR_CHART, "Chart"));
+                                    ui.selectable_value(&mut self.chart_view, false, ico(ICON_TABLE_ROWS, "Table"));
+                                } else {
+                                    self.chart_view = false;
+                                }
                                 ui.menu_button(ico(ICON_DOWNLOAD, "Export"), |ui| {
                                     for f in Format::ALL {
                                         if ui.button(format!("{}…", f.label())).clicked() {
@@ -514,6 +710,11 @@ impl SqlTab {
                                 ui.add(egui::TextEdit::singleline(&mut st.filter).hint_text(ico(ICON_SEARCH, "Filter rows")).desired_width(200.0));
                             });
                         });
+                        if self.chart_view {
+                            let rows = st.view(&rs, self.generation, false).to_vec();
+                            crate::widgets::chart::show(ui, &rs, &rows, &mut self.chart);
+                            return;
+                        }
                         events.extend(
                             Grid {
                                 id: egui::Id::unique(("grid", tab_id, self.active, self.generation)),
@@ -523,14 +724,20 @@ impl SqlTab {
                                 overlay: Overlay::default(),
                                 generation: self.generation,
                                 row_offset: 0,
+                                server_filter: false,
                             }
                             .show(ui, st),
                         );
                         detail_window(ui.ctx(), egui::Id::unique(("detail", tab_id)), &rs, st);
                         for e in events {
-                            if let GridEvent::CopyRows(rows, f) = e {
-                                ui.ctx().copy_text(crate::export::render(&rs, &rows, None, f, Some(self.dialect), ""));
-                                cx.toasts.ok(format!("Copied {} row(s) as {}", rows.len(), f.label()));
+                            match e {
+                                GridEvent::CopyRows(rows, f) => {
+                                    ui.ctx().copy_text(crate::export::render(&rs, &rows, None, f, Some(self.dialect), ""));
+                                    cx.toasts.ok(format!("Copied {} row(s) as {}", rows.len(), f.label()));
+                                }
+                                // Results are filtered in memory: put the value in the filter box.
+                                GridEvent::FilterBy { value, .. } => st.filter = value.to_text().unwrap_or_else(|| "NULL".into()),
+                                _ => {}
                             }
                         }
                     }
@@ -578,7 +785,8 @@ impl SqlTab {
                         plan_node(ui, tree, 0, max_cost, max_ms);
                     } else if let Some(rs) = &p.table {
                         let mut st = GridState::default();
-                        Grid { id: egui::Id::unique("plan_table"), rs, editable: false, server_sort: None, overlay: Overlay::default(), generation: 0, row_offset: 0 }.show(ui, &mut st);
+                        Grid { id: egui::Id::unique("plan_table"), rs, editable: false, server_sort: None, overlay: Overlay::default(), generation: 0, row_offset: 0, server_filter: false }
+                            .show(ui, &mut st);
                     } else {
                         ui.label(RichText::new(&p.raw).monospace());
                     }
@@ -647,4 +855,16 @@ pub fn export_to_file(cx: &mut AppCtx, rs: &openvclient_core::ResultSet, rows: &
         Ok(()) => cx.toasts.ok(format!("Exported {} rows to {}", rows.len(), path.display())),
         Err(e) => cx.toasts.error_text("Export failed", e.to_string()),
     }
+}
+
+/// BEGIN / COMMIT / ROLLBACK in the dialect's spelling.
+fn tx_sql(d: Dialect, verb: &str) -> String {
+    match (d, verb) {
+        (Dialect::SqlServer, v) => format!("{v} TRANSACTION"),
+        (_, v) => v.to_string(),
+    }
+}
+
+fn is_tx_control(sql: &str) -> bool {
+    matches!(leading_keyword(sql).as_str(), "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "END" | "SAVEPOINT")
 }

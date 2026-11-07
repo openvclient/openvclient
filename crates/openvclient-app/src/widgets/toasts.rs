@@ -23,7 +23,13 @@ struct Toast {
     title: String,
     body: Option<String>,
     at: Instant,
+    /// Successes with the same prefix that arrived together ("Connected to …"),
+    /// merged into one toast so a burst does not flood the screen.
+    merged: Vec<String>,
 }
+
+/// Prefixes whose bursts are merged into one toast.
+const MERGE_PREFIXES: [&str; 2] = ["Connected to ", "Disconnected from "];
 
 #[derive(Default)]
 pub struct Toasts {
@@ -33,8 +39,25 @@ pub struct Toasts {
 
 impl Toasts {
     pub fn push(&mut self, level: Level, title: impl Into<String>, body: Option<String>) {
+        let title = title.into();
+        let body = body.filter(|b| !b.is_empty());
+        if level == Level::Success
+            && body.is_none()
+            && let Some(prefix) = MERGE_PREFIXES.iter().find(|p| title.starts_with(**p))
+            && let Some(last) = self.items.iter_mut().rev().find(|t| t.level == Level::Success && !t.sticky && t.at.elapsed() < Duration::from_millis(2500))
+            && last.title.starts_with(prefix)
+        {
+            if last.merged.is_empty() {
+                last.merged.push(last.title[prefix.len()..].to_string());
+            }
+            last.merged.push(title[prefix.len()..].to_string());
+            last.title = format!("{prefix}{} connections", last.merged.len());
+            last.body = Some(last.merged.join(", "));
+            last.at = Instant::now();
+            return;
+        }
         self.next += 1;
-        self.items.push(Toast { sticky: false, id: self.next, level, title: title.into(), body: body.filter(|b| !b.is_empty()), at: Instant::now() });
+        self.items.push(Toast { sticky: false, id: self.next, level, title, body, at: Instant::now(), merged: Vec::new() });
         if self.items.len() > 6 {
             self.items.remove(0);
         }
@@ -81,12 +104,27 @@ impl Toasts {
             return;
         }
         let mut close = None;
+        let mut close_all = false;
+        // Narrower on small windows so toasts never hide most of the content.
+        let width = (ctx.content_rect().width() * 0.28).clamp(240.0, 360.0);
         egui::Area::new(egui::Id::unique("toasts")).anchor(Align2::RIGHT_BOTTOM, [-16.0, -36.0]).order(egui::Order::Tooltip).show(ctx, |ui| {
-            ui.set_max_width(380.0);
+            ui.set_max_width(width + 20.0);
             let t = theme::tokens(ui);
             let hidden = self.items.len().saturating_sub(3);
             if hidden > 0 {
-                ui.label(RichText::new(format!("+{hidden} more")).small().color(t.muted_fg));
+                // A real surface, so the count never draws over the content below.
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_width(width);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("+{hidden} more")).color(t.muted_fg));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Dismiss all").clicked() {
+                                close_all = true;
+                            }
+                        });
+                    });
+                });
+                ui.add_space(theme::space::SM);
             }
             for item in self.items.iter().rev().take(3) {
                 let (icon, color) = match item.level {
@@ -96,7 +134,7 @@ impl Toasts {
                     Level::Error => (ICON_ERROR, t.destructive),
                 };
                 egui::Frame::popup(ui.style()).stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.6))).show(ui, |ui| {
-                    ui.set_width(360.0);
+                    ui.set_width(width);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(String::from(icon)).color(color).size(theme::icon::LG));
                         ui.vertical(|ui| {
@@ -121,6 +159,9 @@ impl Toasts {
                 ui.add_space(theme::space::SM);
             }
         });
+        if close_all {
+            self.items.clear();
+        }
         if let Some(id) = close {
             self.items.retain(|t| t.id != id);
         }

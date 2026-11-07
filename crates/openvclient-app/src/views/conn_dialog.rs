@@ -29,6 +29,85 @@ pub struct ConnDialog {
     ssh_password: String,
     ssh_passphrase: String,
     proxy_password: String,
+    /// "Paste a connection URL" box (new connections only).
+    url: String,
+    /// Footer Cancel was pressed.
+    cancelled: bool,
+}
+
+/// A connection URL split into the form's fields.
+#[derive(Debug, Default, PartialEq)]
+pub struct ParsedUrl {
+    pub driver: &'static str,
+    pub host: String,
+    pub port: Option<u16>,
+    pub user: String,
+    pub password: String,
+    pub database: String,
+}
+
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let Some(v) = std::str::from_utf8(&b[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(v);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parse `scheme://user:pass@host:port/db?…` for the common engines.
+/// Mongo URLs are kept whole (the driver accepts the URI itself).
+pub fn parse_connection_url(url: &str) -> Option<ParsedUrl> {
+    let url = url.trim();
+    let (scheme, rest) = url.split_once("://")?;
+    let driver = match scheme.to_ascii_lowercase().as_str() {
+        "postgres" | "postgresql" => "postgres",
+        "mysql" => "mysql",
+        "mariadb" => "mariadb",
+        "sqlserver" | "mssql" => "sqlserver",
+        "redis" | "rediss" => "redis",
+        "mongodb" | "mongodb+srv" => "mongodb",
+        "clickhouse" => "clickhouse",
+        _ => return None,
+    };
+    let rest = rest.split(['?', '#']).next().unwrap_or("");
+    let (auth, hostpath) = match rest.rsplit_once('@') {
+        Some((a, h)) => (Some(a), h),
+        None => (None, rest),
+    };
+    let (hostport, path) = hostpath.split_once('/').unwrap_or((hostpath, ""));
+    // Only the first host of a multi-host list fills the form.
+    let hostport = hostport.split(',').next().unwrap_or("");
+    let (host, port) = if let Some(h) = hostport.strip_prefix('[') {
+        let (h, p) = h.split_once(']')?;
+        (h.to_string(), p.strip_prefix(':').and_then(|p| p.parse().ok()))
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p.parse().ok()),
+            None => (hostport.to_string(), None),
+        }
+    };
+    let (user, password) = match auth {
+        Some(a) => match a.split_once(':') {
+            Some((u, p)) => (pct_decode(u), pct_decode(p)),
+            None => (pct_decode(a), String::new()),
+        },
+        None => (String::new(), String::new()),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some(ParsedUrl { driver, host: pct_decode(&host), port, user, password, database: pct_decode(path.trim_matches('/')) })
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -61,6 +140,8 @@ impl ConnDialog {
                     ssh_password: String::new(),
                     ssh_passphrase: String::new(),
                     proxy_password: String::new(),
+                    url: String::new(),
+                    cancelled: false,
                 }
             }
         }
@@ -91,6 +172,8 @@ impl ConnDialog {
             ssh_password: String::new(),
             ssh_passphrase: String::new(),
             proxy_password: String::new(),
+            url: String::new(),
+            cancelled: false,
         }
     }
 
@@ -164,7 +247,7 @@ impl ConnDialog {
                 open = false;
             }
         });
-        open && !close
+        open && !close && !self.cancelled
     }
 
     fn picker(&mut self, ui: &mut egui::Ui, cx: &AppCtx) {
@@ -185,16 +268,33 @@ impl ConnDialog {
             .filter(|i| f.is_empty() || i.name.to_lowercase().contains(&f) || i.id.contains(&f) || i.description.to_lowercase().contains(&f))
             .collect();
         let mut chosen = None;
-        // One flat list of compact tiles: icon + name; details in the tooltip.
-        crate::widgets::cards::grid(ui, &infos, 176.0, 40.0, |ui, info, resp| {
-            ui.horizontal_centered(|ui| {
-                crate::views::driver_glyph(ui, info.id, theme::icon::MD, t.accent);
-                ui.add(egui::Label::new(RichText::new(info.name).strong()).truncate());
-            });
-            if resp.clone().on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(info.description).clicked() {
-                chosen = Some(info.id);
+        // Grouped by kind so the list scans quickly; each group has its own colour.
+        use openvclient_core::Category as C;
+        let groups: [(&str, &[C], egui::Color32); 4] = [
+            ("Databases", &[C::Relational, C::Analytical], t.accent),
+            ("NoSQL, search and queues", &[C::Document, C::KeyValue, C::Search, C::Messaging], t.warning),
+            ("Object storage", &[C::Storage], t.info),
+            ("Servers and containers", &[C::Remote, C::Containers], t.fg),
+        ];
+        for (title, cats, color) in groups {
+            let members: Vec<_> = infos.iter().filter(|i| cats.contains(&i.category)).cloned().collect();
+            if members.is_empty() {
+                continue;
             }
-        });
+            ui.label(RichText::new(format!("{}  ·  {}", title.to_uppercase(), members.len())).small().strong().color(t.muted_fg));
+            ui.add_space(theme::space::XS);
+            crate::widgets::cards::grid(ui, &members, 176.0, 40.0, |ui, info, resp| {
+                ui.horizontal_centered(|ui| {
+                    crate::views::driver_glyph(ui, info.id, theme::icon::MD, color);
+                    ui.add(egui::Label::new(RichText::new(info.name).strong()).truncate());
+                });
+                let resp = resp.clone().on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(format!("{}\n{}", info.name, info.description));
+                if resp.clicked() {
+                    chosen = Some(info.id);
+                }
+            });
+            ui.add_space(theme::space::SM);
+        }
         if infos.is_empty() {
             ui.label(RichText::new("No connector matches").color(t.muted_fg));
         }
@@ -243,9 +343,52 @@ impl ConnDialog {
             return self.footer(ui, cx, &driver);
         }
         let folders = cx.store.all_folders();
+        if self.is_new && networked {
+            ui.horizontal(|ui| {
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut self.url).hint_text(ico(ICON_LINK, "Paste a connection URL, e.g. postgres://user:pass@host:5432/db")).desired_width(ui.available_width() - 90.0),
+                );
+                let go = ui.button("Fill in").on_hover_text("Fill the fields below from the URL");
+                if (go.clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))) && !self.url.trim().is_empty() {
+                    match parse_connection_url(&self.url) {
+                        Some(u) => {
+                            if u.driver != self.p.driver && cx.conns.registry.get(u.driver).is_some() {
+                                self.pick(cx, u.driver);
+                            }
+                            if u.driver == "mongodb" {
+                                self.p.params.insert("uri".into(), self.url.trim().to_string());
+                            }
+                            self.p.params.insert("host".into(), u.host);
+                            if let Some(port) = u.port {
+                                self.p.params.insert("port".into(), port.to_string());
+                            }
+                            if !u.user.is_empty() {
+                                self.p.params.insert("user".into(), u.user);
+                            }
+                            if !u.database.is_empty() {
+                                self.p.params.insert("database".into(), u.database);
+                            }
+                            if !u.password.is_empty() {
+                                self.secret = u.password;
+                            }
+                            self.url.clear();
+                            self.error = None;
+                        }
+                        None => self.error = Some("That does not look like a postgres://, mysql://, sqlserver://, redis://, mongodb:// or clickhouse:// URL".into()),
+                    }
+                }
+            });
+            ui.add_space(theme::space::SM);
+        }
+        let duplicate = cx.store.ws.profiles.iter().any(|p| p.id != self.p.id && p.name.trim().eq_ignore_ascii_case(self.p.name.trim()));
         egui::Grid::new("conn_form").num_columns(2).spacing([14.0, 10.0]).min_col_width(130.0).show(ui, |ui| {
-            ui.label("Name");
-            ui.add(egui::TextEdit::singleline(&mut self.p.name).desired_width(f32::INFINITY));
+            ui.label("Name *");
+            ui.vertical(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.p.name).desired_width(f32::INFINITY));
+                if duplicate {
+                    ui.label(RichText::new(ico(ICON_WARNING, "Another connection already has this name")).small().color(t.warning));
+                }
+            });
             ui.end_row();
             ui.label("Environment");
             ui.horizontal(|ui| {
@@ -373,7 +516,11 @@ impl ConnDialog {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let label = if self.is_new { "Save & connect" } else { "Save" };
-                if theme::primary_button(ui, label).clicked() {
+                let save_clicked = theme::primary_button(ui, label).clicked();
+                if ui.button("Cancel").on_hover_text("Close without saving (Esc)").clicked() {
+                    self.cancelled = true;
+                }
+                if save_clicked {
                     match self.validate(cx) {
                         Ok(()) => {
                             let id = self.p.id;
@@ -596,9 +743,34 @@ impl ConnDialog {
             }
             FieldKind::Text | FieldKind::Number => {
                 let v = self.p.params.entry(f.key.into()).or_default();
-                ui.add(egui::TextEdit::singleline(v).hint_text(hint).desired_width(f32::INFINITY));
+                let bad = f.kind == FieldKind::Number && !v.trim().is_empty() && v.trim().parse::<f64>().is_err();
+                ui.vertical(|ui| {
+                    ui.add(egui::TextEdit::singleline(v).hint_text(hint).desired_width(f32::INFINITY));
+                    // Errors sit next to the field they belong to.
+                    if bad {
+                        ui.label(RichText::new(format!("{} must be a number", f.label)).small().color(theme::tokens(ui).destructive));
+                    }
+                });
             }
         }
         ui.end_row();
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::*;
+
+    #[test]
+    fn parses_common_urls() {
+        let u = parse_connection_url("postgres://alice:p%40ss@db.example.com:6543/shop?sslmode=require").unwrap();
+        assert_eq!(u, ParsedUrl { driver: "postgres", host: "db.example.com".into(), port: Some(6543), user: "alice".into(), password: "p@ss".into(), database: "shop".into() });
+        let u = parse_connection_url("mysql://root@127.0.0.1/app").unwrap();
+        assert_eq!((u.driver, u.host.as_str(), u.port, u.user.as_str(), u.password.as_str(), u.database.as_str()), ("mysql", "127.0.0.1", None, "root", "", "app"));
+        let u = parse_connection_url("redis://:secret@[::1]:6380/2").unwrap();
+        assert_eq!((u.host.as_str(), u.port, u.password.as_str(), u.database.as_str()), ("::1", Some(6380), "secret", "2"));
+        assert_eq!(parse_connection_url("mongodb+srv://u:p@cluster0.x.net/db").unwrap().driver, "mongodb");
+        assert!(parse_connection_url("ftp://x").is_none());
+        assert!(parse_connection_url("not a url").is_none());
     }
 }

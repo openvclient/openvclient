@@ -244,7 +244,40 @@ pub fn sql_editor(ui: &mut egui::Ui, id: egui::Id, text: &mut String, dialect: D
         }
     }
 
-    let out = egui::TextEdit::multiline(text).id(id).code_editor().font(FontId::monospace(font_size)).desired_width(f32::INFINITY).desired_rows(12).lock_focus(true).layouter(&mut layouter).show(ui);
+    // Line-number gutter: reserve a left margin wide enough for the largest
+    // line number, then paint the numbers beside each logical line.
+    let lines = text.lines().count().max(1) + usize::from(text.ends_with('\n'));
+    let digits = lines.to_string().len().max(2) as f32;
+    let gutter = digits * font_size * 0.62 + 14.0;
+    let out = egui::TextEdit::multiline(text)
+        .id(id)
+        .code_editor()
+        .font(FontId::monospace(font_size))
+        .desired_width(f32::INFINITY)
+        .desired_rows(4)
+        .min_size(egui::vec2(0.0, (ui.available_height() - 2.0).max(60.0)))
+        .margin(egui::Margin { left: gutter as i8, right: 6, top: 4, bottom: 4 })
+        .lock_focus(true)
+        .layouter(&mut layouter)
+        .show(ui);
+    {
+        let tk = crate::theme::tokens(ui);
+        let painter = ui.painter_at(out.response.rect);
+        let cur_line = out.cursor_range.map(|r| text.chars().take(r.primary.index.0).filter(|c| *c == '\n').count());
+        let mut line = 0usize;
+        let mut new_line = true;
+        let x = out.response.rect.left() + gutter - 8.0;
+        for row in &out.galley.rows {
+            if new_line {
+                let y = out.galley_pos.y + row.rect().center().y;
+                let color = if cur_line == Some(line) { tk.fg } else { tk.muted_fg.gamma_multiply(0.7) };
+                painter.text(egui::pos2(x, y), egui::Align2::RIGHT_CENTER, (line + 1).to_string(), FontId::monospace(font_size * 0.85), color);
+                line += 1;
+            }
+            new_line = row.ends_with_newline;
+        }
+        painter.vline(out.response.rect.left() + gutter - 3.0, out.response.rect.y_range(), egui::Stroke::new(1.0, tk.border.gamma_multiply(0.6)));
+    }
     if st.focus {
         out.response.request_focus();
         st.focus = false;

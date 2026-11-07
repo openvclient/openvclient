@@ -1,6 +1,6 @@
 //! Saved workspace (profiles, folders, preferences) and keychain secrets.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use openvclient_core::ConnectionProfile;
 use serde::{Deserialize, Serialize};
@@ -49,6 +49,32 @@ pub struct Settings {
     /// Look for a newer release on GitHub at startup.
     #[serde(default = "default_true")]
     pub check_updates: bool,
+    /// Whole-app zoom (also ⌘= / ⌘−).
+    #[serde(default = "default_zoom")]
+    pub ui_zoom: f32,
+    /// How NULL cells are shown in grids.
+    #[serde(default = "default_null")]
+    pub null_display: String,
+    /// Drop fractional seconds from timestamps in grids (copy keeps the full value).
+    #[serde(default = "default_true")]
+    pub short_timestamps: bool,
+    /// Cancel a SQL run after this many seconds (0 = never).
+    #[serde(default)]
+    pub query_timeout_secs: u64,
+    /// Ask for the typed name on Staging connections too.
+    #[serde(default)]
+    pub confirm_staging: bool,
+    /// Home groups connection cards by sidebar folder instead of most recent first.
+    #[serde(default)]
+    pub home_by_folder: bool,
+}
+
+fn default_zoom() -> f32 {
+    1.0
+}
+
+fn default_null() -> String {
+    "NULL".into()
 }
 
 fn default_scroll() -> f32 {
@@ -79,6 +105,12 @@ impl Default for Settings {
             confirm_production: true,
             scroll_speed: default_scroll(),
             check_updates: true,
+            ui_zoom: default_zoom(),
+            null_display: default_null(),
+            short_timestamps: true,
+            query_timeout_secs: 0,
+            confirm_staging: false,
+            home_by_folder: false,
         }
     }
 }
@@ -95,6 +127,12 @@ pub struct Workspace {
     /// Recently run SQL per connection, newest first.
     #[serde(default)]
     pub history: Vec<HistoryEntry>,
+    /// Saved SQL snippets, shared by every connection.
+    #[serde(default)]
+    pub snippets: Vec<Snippet>,
+    /// Tabs open when the app last closed, reopened at start-up.
+    #[serde(default)]
+    pub session: Vec<SavedTab>,
     /// Connections pinned to Home, in the order they were starred.
     #[serde(default)]
     pub favorites: Vec<Uuid>,
@@ -106,6 +144,40 @@ pub struct HistoryEntry {
     pub sql: String,
     pub at: String,
     pub ok: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Snippet {
+    pub name: String,
+    pub sql: String,
+}
+
+/// A tab that can be reopened after a restart.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "tab", rename_all = "snake_case")]
+pub enum SavedTab {
+    Sql { conn: Uuid, database: Option<String>, text: String },
+    Table { conn: Uuid, kind: openvclient_core::sql::ObjectKind, path: openvclient_core::sql::ObjPath },
+    Monitor { conn: Uuid },
+    Redis { conn: Uuid, db: u32 },
+}
+
+impl SavedTab {
+    pub fn conn(&self) -> Uuid {
+        match self {
+            SavedTab::Sql { conn, .. } | SavedTab::Table { conn, .. } | SavedTab::Monitor { conn } | SavedTab::Redis { conn, .. } => *conn,
+        }
+    }
+
+    pub fn into_cmd(self) -> crate::app::Cmd {
+        use crate::app::Cmd;
+        match self {
+            SavedTab::Sql { conn, database, text } => Cmd::NewSql { conn, database, text },
+            SavedTab::Table { conn, kind, path } => Cmd::OpenTable { conn, kind, path },
+            SavedTab::Monitor { conn } => Cmd::OpenMonitor(conn),
+            SavedTab::Redis { conn, db } => Cmd::OpenRedis { conn, db },
+        }
+    }
 }
 
 pub struct Store {
@@ -236,6 +308,40 @@ impl Store {
             Some(slot) => *slot = p,
             None => self.ws.profiles.push(p),
         }
+    }
+
+    /// Write every connection, without secrets, to `path`. Passwords live in
+    /// the keychain; user:pass@ in connection strings is redacted too.
+    pub fn export_profiles(&self, path: &Path) -> Result<usize, String> {
+        let mut out = self.ws.profiles.clone();
+        for p in &mut out {
+            for v in p.params.values_mut() {
+                if v.contains("://") {
+                    *v = openvclient_core::redact(v);
+                }
+            }
+        }
+        let json = serde_json::to_vec_pretty(&serde_json::json!({ "openvclient_connections": 1, "profiles": out })).map_err(|e| e.to_string())?;
+        std::fs::write(path, json).map_err(|e| e.to_string())?;
+        Ok(out.len())
+    }
+
+    /// Add connections from an exported file. Existing ids are left alone.
+    pub fn import_profiles(&mut self, path: &Path) -> Result<(usize, usize), String> {
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| format!("Not a connections file: {e}"))?;
+        let list = v.get("profiles").cloned().ok_or("Not a connections file (no \"profiles\")")?;
+        let profiles: Vec<ConnectionProfile> = serde_json::from_value(list).map_err(|e| format!("Not a connections file: {e}"))?;
+        let (mut added, mut skipped) = (0, 0);
+        for p in profiles {
+            if self.ws.profiles.iter().any(|x| x.id == p.id) {
+                skipped += 1;
+            } else {
+                self.ws.profiles.push(p);
+                added += 1;
+            }
+        }
+        Ok((added, skipped))
     }
 
     pub fn remove(&mut self, id: Uuid) {

@@ -4,6 +4,7 @@ mod app;
 mod bg;
 mod conns;
 mod export;
+mod pdf;
 mod store;
 mod theme;
 mod update;

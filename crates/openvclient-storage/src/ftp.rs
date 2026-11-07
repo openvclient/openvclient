@@ -506,6 +506,20 @@ impl ResourceSession for FtpSession {
             return Ok(Content::TableWithNote(rs, format!("{n} item(s) in {dir}")));
         }
         let path = node.strip_prefix("f:").ok_or_else(|| Error::invalid("Bad node"))?;
+        if openvclient_core::resource::is_image_name(path) {
+            let max = openvclient_core::resource::IMAGE_PREVIEW_MAX as usize;
+            let data = self.read(path, Some(max)).await?;
+            if data.len() <= max {
+                return Ok(Content::Image(data));
+            }
+        }
+        if openvclient_core::resource::is_pdf_name(path) {
+            let max = openvclient_core::resource::IMAGE_PREVIEW_MAX as usize;
+            let data = self.read(path, Some(max)).await?;
+            if data.len() <= max {
+                return Ok(Content::Pdf(data));
+            }
+        }
         let data = self.read(path, Some(PREVIEW_MAX)).await?;
         if data.len() > PREVIEW_MAX {
             return Ok(Content::Empty("File is larger than 1 MiB; use Download".into()));

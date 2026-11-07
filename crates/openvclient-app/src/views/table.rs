@@ -28,6 +28,8 @@ pub struct TableTab {
     view: View,
     filter: String,
     applied_filter: Option<String>,
+    /// Filters applied in this tab, newest first.
+    recent_filters: Vec<String>,
     order: Vec<(String, SortDir)>,
     limit: u64,
     offset: u64,
@@ -43,7 +45,7 @@ pub struct TableTab {
     deleted: HashSet<usize>,
     inserted: usize,
     save_job: Option<Job<Result<u64>>>,
-    grid: GridState,
+    pub grid: GridState,
     generation: u64,
 }
 
@@ -56,6 +58,7 @@ impl TableTab {
             view: View::Data,
             filter: String::new(),
             applied_filter: None,
+            recent_filters: Vec::new(),
             order: Vec::new(),
             limit: cx.store.ws.settings.page_size,
             offset: 0,
@@ -175,12 +178,20 @@ impl TableTab {
         let mut apply = refresh;
         ui.horizontal(|ui| {
             ui.label(RichText::new("WHERE").monospace().strong().color(t.muted_fg));
-            let r = ui.add(
-                egui::TextEdit::singleline(&mut self.filter)
-                    .font(egui::TextStyle::Monospace)
-                    .hint_text("e.g. status = 'active' AND created_at > now() - interval '1 day'")
-                    .desired_width(ui.available_width() - 210.0),
-            );
+            let r = ui.add(egui::TextEdit::singleline(&mut self.filter).font(egui::TextStyle::Monospace).hint_text(where_example(dialect)).desired_width(ui.available_width() - 250.0));
+            if !self.recent_filters.is_empty() {
+                ui.menu_button(String::from(ICON_HISTORY), |ui| {
+                    for f in self.recent_filters.clone() {
+                        if ui.button(RichText::new(&f).monospace()).clicked() {
+                            self.filter = f;
+                            apply = true;
+                            ui.close();
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Recent filters");
+            }
             if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                 apply = true;
             }
@@ -200,6 +211,11 @@ impl TableTab {
                 cx.toasts.warn("Unsaved changes", "Save or discard your edits before reloading.");
             } else {
                 self.applied_filter = (!self.filter.trim().is_empty()).then(|| self.filter.trim().to_string());
+                if let Some(f) = &self.applied_filter {
+                    self.recent_filters.retain(|x| x != f);
+                    self.recent_filters.insert(0, f.clone());
+                    self.recent_filters.truncate(10);
+                }
                 self.offset = 0;
                 self.count = None;
                 self.load(cx);
@@ -324,6 +340,7 @@ impl TableTab {
                     overlay: Overlay { edited: Some(&self.edits), deleted: Some(&self.deleted), inserted_from: Some(base) },
                     generation: self.generation,
                     row_offset: self.offset,
+                    server_filter: true,
                 }
                 .show(ui, &mut self.grid);
                 detail_window(ui.ctx(), egui::Id::unique(("tdetail", tab_id)), &rs, &mut self.grid);
@@ -361,6 +378,18 @@ impl TableTab {
                         GridEvent::CopyRows(rows, f) => {
                             ui.ctx().copy_text(crate::export::render(&rs, &rows, None, f, Some(dialect), &dialect.qualified(self.path.schema.as_deref(), self.path.name.as_deref().unwrap_or(""))));
                             cx.toasts.ok(format!("Copied {} row(s) as {}", rows.len(), f.label()));
+                        }
+                        GridEvent::FilterBy { col, value, exclude } => {
+                            if self.pending() > 0 {
+                                cx.toasts.warn("Unsaved changes", "Save or discard before filtering.");
+                                continue;
+                            }
+                            let cond = filter_condition(dialect, &rs.columns[col].name, &value, exclude);
+                            let cur = self.filter.trim();
+                            self.filter = if cur.is_empty() { cond } else { format!("({cur}) AND {cond}") };
+                            self.applied_filter = Some(self.filter.clone());
+                            self.offset = 0;
+                            self.load(cx);
                         }
                     }
                 }
@@ -494,7 +523,31 @@ pub fn structure_ui(ui: &mut egui::Ui, cols: &Option<Result<Vec<ColumnInfo>>>, t
                     .collect(),
             );
             let mut st = GridState::default();
-            Grid { id: egui::Id::unique(("structure", tab_id)), rs: &rs, editable: false, server_sort: None, overlay: Overlay::default(), generation: 0, row_offset: 0 }.show(ui, &mut st);
+            Grid { id: egui::Id::unique(("structure", tab_id)), rs: &rs, editable: false, server_sort: None, overlay: Overlay::default(), generation: 0, row_offset: 0, server_filter: false }
+                .show(ui, &mut st);
+        }
+    }
+}
+
+/// A WHERE example in the connection's own SQL dialect.
+fn where_example(d: openvclient_core::sqltext::Dialect) -> &'static str {
+    use openvclient_core::sqltext::Dialect::*;
+    match d {
+        Postgres => "e.g. status = 'active' AND created_at > now() - interval '1 day'",
+        MySql => "e.g. status = 'active' AND created_at > NOW() - INTERVAL 1 DAY",
+        Sqlite => "e.g. status = 'active' AND created_at > datetime('now', '-1 day')",
+        SqlServer => "e.g. status = 'active' AND created_at > DATEADD(day, -1, GETDATE())",
+    }
+}
+
+/// `col = value` (or `<>`), quoted for the dialect; NULL uses IS [NOT] NULL.
+fn filter_condition(d: openvclient_core::sqltext::Dialect, col: &str, v: &openvclient_core::Value, exclude: bool) -> String {
+    let c = d.quote_ident(col);
+    match v {
+        openvclient_core::Value::Null => format!("{c} IS {}NULL", if exclude { "NOT " } else { "" }),
+        other => {
+            let lit = if other.is_numeric() { other.to_text().unwrap_or_default() } else { d.quote_literal(&other.to_text().unwrap_or_default()) };
+            format!("{c} {} {lit}", if exclude { "<>" } else { "=" })
         }
     }
 }

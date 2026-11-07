@@ -1,6 +1,8 @@
+pub mod compare;
 pub mod conn_dialog;
 pub mod dialogs;
 pub mod docker;
+pub mod erd;
 pub mod files;
 pub mod home;
 pub mod monitor;
@@ -111,6 +113,9 @@ pub const SHORTCUTS: &[(&str, &str, &str)] = &[
     ("General", "⌘N", "New connection"),
     ("General", "⌘⇧H", "Home"),
     ("General", "⌘W", "Close tab"),
+    ("General", "⌘⇧T", "Reopen closed tab"),
+    ("General", "⌘B", "Hide or show the sidebar"),
+    ("General", "⌘1 … ⌘9", "Switch to tab 1–8, or the last tab"),
     ("General", "F5", "Refresh the current view"),
     ("General", "⌘/", "Keyboard shortcuts"),
     ("SQL editor", "⌘T", "New SQL editor for the focused connection"),
@@ -119,6 +124,7 @@ pub const SHORTCUTS: &[(&str, &str, &str)] = &[
     ("SQL editor", "⌘E", "Explain statement"),
     ("SQL editor", "⌘.", "Cancel running query"),
     ("SQL editor", "⌘S", "Save SQL to file"),
+    ("SQL editor", "⌘⇧F", "Format SQL (or the selection)"),
     ("SQL editor", "⌃Space", "Autocomplete"),
 ];
 
@@ -196,4 +202,15 @@ pub fn busy(ui: &mut egui::Ui, label: &str) {
         ui.add(egui::Spinner::new().size(14.0));
         ui.label(RichText::new(label).color(theme::muted(ui)));
     });
+}
+
+/// What an environment badge changes, for its tooltip.
+pub fn env_tip(e: openvclient_core::Environment) -> &'static str {
+    use openvclient_core::Environment::*;
+    match e {
+        Development => "Development: no extra safety prompts",
+        Testing => "Testing: no extra safety prompts",
+        Staging => "Staging: amber badge; type-to-confirm when enabled in Settings → Safety",
+        Production => "Production: red tab bar, and destructive actions need the name typed to confirm",
+    }
 }

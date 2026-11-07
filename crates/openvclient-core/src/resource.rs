@@ -75,6 +75,23 @@ pub enum Content {
     /// Rows plus a note (e.g. "first 100 of 9,201").
     TableWithNote(ResultSet, String),
     Empty(String),
+    /// Encoded image bytes (PNG, JPEG, GIF, WebP, BMP) for an inline preview.
+    Image(Vec<u8>),
+    /// A PDF document; the app renders its first page when a renderer is available.
+    Pdf(Vec<u8>),
+}
+
+pub fn is_pdf_name(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".pdf")
+}
+
+/// Images up to this size are previewed inline.
+pub const IMAGE_PREVIEW_MAX: u64 = 8 * 1024 * 1024;
+
+/// Whether a file name looks like an image the preview can show.
+pub fn is_image_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"].iter().any(|e| n.ends_with(e))
 }
 
 /// Options for opening a node: paging and an engine-native filter.

@@ -164,8 +164,17 @@ impl UsersTab {
         let host_col = rs.column_index("host");
         let avail = ui.available_height();
         egui::Panel::top(egui::Id::unique(("users_list", self.conn))).resizable(true).default_size(avail * 0.45).show(ui, |ui| {
-            Grid { id: egui::Id::unique(("users", self.conn)), rs: &rs, editable: false, server_sort: None, overlay: Overlay::default(), generation: self.generation, row_offset: 0 }
-                .show(ui, &mut self.grid);
+            Grid {
+                id: egui::Id::unique(("users", self.conn)),
+                rs: &rs,
+                editable: false,
+                server_sort: None,
+                overlay: Overlay::default(),
+                generation: self.generation,
+                row_offset: 0,
+                server_filter: false,
+            }
+            .show(ui, &mut self.grid);
         });
         let sel = self.grid.selected.and_then(|(r, _)| rs.rows.get(r)).map(|row| (row[0].to_text().unwrap_or_default(), host_col.and_then(|h| row[h].to_text())));
         if sel != self.selected {
@@ -252,8 +261,17 @@ impl UsersTab {
             Some(Err(e)) => crate::views::error_box(ui, &e.clone()),
             Some(Ok(p)) => {
                 let p = p.clone();
-                Grid { id: egui::Id::unique(("privs", self.conn)), rs: &p, editable: false, server_sort: None, overlay: Overlay::default(), generation: self.generation, row_offset: 0 }
-                    .show(ui, &mut self.pgrid);
+                Grid {
+                    id: egui::Id::unique(("privs", self.conn)),
+                    rs: &p,
+                    editable: false,
+                    server_sort: None,
+                    overlay: Overlay::default(),
+                    generation: self.generation,
+                    row_offset: 0,
+                    server_filter: false,
+                }
+                .show(ui, &mut self.pgrid);
             }
         }
     }

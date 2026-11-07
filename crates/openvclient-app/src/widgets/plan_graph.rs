@@ -7,7 +7,8 @@ use egui::{Align2, FontId, Rect, Sense, Stroke, Vec2, pos2, vec2};
 use egui_material_icons::icons::*;
 use openvclient_core::explain::PlanNode;
 
-use crate::theme;
+use crate::theme::{self, ico};
+use egui::RichText;
 
 const W: f32 = 196.0;
 const H: f32 = 78.0;
@@ -19,6 +20,8 @@ const PAD: f32 = 16.0;
 #[derive(Default, Clone)]
 pub struct PlanView {
     pub selected: Option<Vec<usize>>,
+    /// Zoom factor; `None` means fit the whole plan into view.
+    pub zoom: Option<f32>,
 }
 
 struct Placed<'a> {
@@ -117,24 +120,44 @@ impl PlanView {
         let selected_path = self.selected.clone();
 
         let props_h = if selected_path.is_some() { 170.0 } else { 0.0 };
+        // Zoom bar: fit the whole plan (default), or step in and out.
+        let fit = (ui.available_width() / size.x).min((ui.available_height() - props_h - 40.0).max(120.0) / size.y).clamp(0.35, 1.0);
+        let z = self.zoom.unwrap_or(fit);
+        ui.horizontal(|ui| {
+            if ui.selectable_label(self.zoom.is_none(), ico(ICON_FIT_SCREEN, "Fit")).on_hover_text("Fit the whole plan in view").clicked() {
+                self.zoom = None;
+            }
+            if ui.small_button(String::from(ICON_ZOOM_OUT)).on_hover_text("Zoom out").clicked() {
+                self.zoom = Some((z - 0.15).max(0.35));
+            }
+            ui.label(RichText::new(format!("{:.0}%", z * 100.0)).color(t.muted_fg));
+            if ui.small_button(String::from(ICON_ZOOM_IN)).on_hover_text("Zoom in").clicked() {
+                self.zoom = Some((z + 0.15).min(2.0));
+            }
+            if ui.small_button("100%").on_hover_text("Actual size").clicked() {
+                self.zoom = Some(1.0);
+            }
+        });
         let graph_h = (ui.available_height() - props_h).max(160.0);
         egui::ScrollArea::both().id_salt("plan_graph").max_height(graph_h).auto_shrink([false, false]).show(ui, |ui| {
-            let (area, _) = ui.allocate_exact_size(size.max(vec2(ui.available_width(), 0.0)), Sense::hover());
-            let o = area.min.to_vec2();
+            let (area, _) = ui.allocate_exact_size((size * z).max(vec2(ui.available_width(), 0.0)), Sense::hover());
+            // Layout is computed at 100%; scale every rect, offset and font by `z`.
+            let sc = |r: Rect| Rect::from_min_size(area.min + r.min.to_vec2() * z, r.size() * z);
+            let f = |px: f32| FontId::proportional(px * z);
             let painter = ui.painter_at(area);
 
             // Arrows first so boxes sit on top. Data flows child -> parent (right to left).
             for p in &placed {
                 let Some(pi) = p.parent else { continue };
-                let parent = placed[pi].rect.translate(o);
-                let child = p.rect.translate(o);
+                let parent = sc(placed[pi].rect);
+                let child = sc(p.rect);
                 let r = rows(p.node).unwrap_or(1.0);
-                let width = (1.0 + (r + 1.0).log10() as f32 * 1.4).clamp(1.0, 9.0);
+                let width = (1.0 + (r + 1.0).log10() as f32 * 1.4).clamp(1.0, 9.0) * z.max(0.5);
                 let stroke = Stroke::new(width, t.muted_fg.gamma_multiply(0.7));
                 let start = pos2(child.left(), child.center().y);
-                let end = pos2(parent.right(), parent.top() + 24.0);
+                let end = pos2(parent.right(), parent.top() + 24.0 * z);
                 let mid_x = (start.x + end.x) / 2.0;
-                painter.line(vec![start, pos2(mid_x, start.y), pos2(mid_x, end.y), pos2(end.x + 6.0, end.y)], stroke);
+                painter.line(vec![start, pos2(mid_x, start.y), pos2(mid_x, end.y), pos2(end.x + 6.0 * z, end.y)], stroke);
                 // Arrow head into the parent.
                 let tip = end;
                 painter.add(egui::Shape::convex_polygon(
@@ -143,12 +166,12 @@ impl PlanView {
                     Stroke::NONE,
                 ));
                 if let Some(rv) = rows(p.node) {
-                    painter.text(pos2((mid_x + start.x) / 2.0, start.y - width / 2.0 - 2.0), Align2::CENTER_BOTTOM, fmt_num(rv), FontId::proportional(10.5), t.muted_fg);
+                    painter.text(pos2((mid_x + start.x) / 2.0, start.y - width / 2.0 - 2.0), Align2::CENTER_BOTTOM, fmt_num(rv), f(10.5), t.muted_fg);
                 }
             }
 
             for p in &placed {
-                let rect = p.rect.translate(o);
+                let rect = sc(p.rect);
                 let resp = ui.interact(rect, ui.scope_id().with(("plan_node", &p.path)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
                 let is_sel = selected_path.as_deref() == Some(p.path.as_slice());
                 let share = match (own_cost(p.node), total) {
@@ -170,15 +193,15 @@ impl PlanView {
                 } else {
                     t.card
                 };
-                painter.rect(rect, 8.0, fill, Stroke::new(if is_sel { 2.0 } else { 1.0 }, if is_sel { t.ring } else { t.border }), egui::StrokeKind::Inside);
+                painter.rect(rect, 8.0 * z, fill, Stroke::new(if is_sel { 2.0 } else { 1.0 }, if is_sel { t.ring } else { t.border }), egui::StrokeKind::Inside);
                 // Cost heat strip on the left edge.
-                painter.rect_filled(Rect::from_min_size(rect.min, vec2(4.0, rect.height())), egui::CornerRadius { nw: 8, sw: 8, ne: 0, se: 0 }, accent);
+                painter.rect_filled(Rect::from_min_size(rect.min, vec2(4.0 * z, rect.height())), egui::CornerRadius { nw: 8, sw: 8, ne: 0, se: 0 }, accent);
 
-                painter.text(pos2(rect.left() + 20.0, rect.top() + 20.0), Align2::CENTER_CENTER, icon(&p.node.title), FontId::proportional(18.0), accent);
-                let title_clip = Rect::from_min_max(pos2(rect.left() + 34.0, rect.top() + 6.0), pos2(rect.right() - 8.0, rect.top() + 46.0));
+                painter.text(pos2(rect.left() + 20.0 * z, rect.top() + 20.0 * z), Align2::CENTER_CENTER, icon(&p.node.title), f(18.0), accent);
+                let title_clip = Rect::from_min_max(pos2(rect.left() + 34.0 * z, rect.top() + 6.0 * z), pos2(rect.right() - 8.0 * z, rect.top() + 46.0 * z));
                 let job = egui::text::LayoutJob {
                     wrap: egui::text::TextWrapping { max_width: title_clip.width(), max_rows: 2, break_anywhere: false, overflow_character: Some('…') },
-                    ..egui::text::LayoutJob::simple(p.node.title.clone(), FontId::proportional(12.5), t.fg, title_clip.width())
+                    ..egui::text::LayoutJob::simple(p.node.title.clone(), f(12.5), t.fg, title_clip.width())
                 };
                 let g = ui.fonts_mut(|f| f.layout_job(job));
                 painter.with_clip_rect(title_clip).galley(title_clip.min, g, t.fg);
@@ -194,12 +217,12 @@ impl PlanView {
                     line.push(format!("{} rows", fmt_num(r)));
                 }
                 let lc = if hot >= 20.0 { accent } else { t.muted_fg };
-                painter.with_clip_rect(rect.shrink(4.0)).text(pos2(rect.left() + 12.0, rect.bottom() - 14.0), Align2::LEFT_CENTER, line.join(" · "), FontId::proportional(11.5), lc);
+                painter.with_clip_rect(rect.shrink(4.0 * z)).text(pos2(rect.left() + 12.0 * z, rect.bottom() - 14.0 * z), Align2::LEFT_CENTER, line.join(" · "), f(11.5), lc);
                 if max_ms > 0.0
                     && let Some(ms) = p.node.actual_ms
                 {
                     let frac = (ms / max_ms) as f32;
-                    let bar = Rect::from_min_size(pos2(rect.left() + 12.0, rect.bottom() - 5.0), vec2((rect.width() - 24.0) * frac.clamp(0.02, 1.0), 2.0));
+                    let bar = Rect::from_min_size(pos2(rect.left() + 12.0 * z, rect.bottom() - 5.0 * z), vec2((rect.width() - 24.0 * z) * frac.clamp(0.02, 1.0), 2.0));
                     painter.rect_filled(bar, 1.0, accent);
                 }
                 if resp.clicked() {

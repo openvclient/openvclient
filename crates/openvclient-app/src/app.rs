@@ -64,6 +64,27 @@ pub enum Cmd {
     RefreshTree(Uuid),
     InvalidateCatalog(Uuid),
     FocusTab(u64),
+    OpenErd {
+        conn: Uuid,
+        database: Option<String>,
+        schema: String,
+    },
+    OpenCompare {
+        conn: Uuid,
+        database: Option<String>,
+        schema: String,
+    },
+}
+
+/// Tab-strip requests (context menu, open-tabs list), applied after the
+/// tile tree has been drawn because they need the whole tree.
+#[derive(Clone, Copy)]
+pub enum TabAction {
+    CloseOthers(TileId),
+    CloseRight(TileId),
+    CloseAll(TileId),
+    Focus(TileId),
+    Reopen,
 }
 
 /// A confirmation guarding a destructive action. Production connections
@@ -137,10 +158,19 @@ pub struct AppCtx {
     pub show_settings: bool,
     pub show_about: bool,
     pub show_shortcuts: bool,
+    /// Sidebar folded away (⌘B) to give the content the whole width.
+    pub sidebar_hidden: bool,
     /// Statements confirmed for production, keyed by tab id.
     pub pending_sql: Option<(u64, Vec<String>)>,
     /// Confirmed destructive resource actions, picked up by the connection's tab.
     pub resource_jobs: HashMap<Uuid, Job<Result<openvclient_core::resource::ActionOutcome>>>,
+    pub tab_actions: Vec<TabAction>,
+    /// Commands that reopen recently closed tabs, newest last (⌘⇧T).
+    pub closed_tabs: Vec<Cmd>,
+    /// Tabs from the last session, offered on Home until restored or dismissed.
+    pub restore_offer: Vec<crate::store::SavedTab>,
+    /// Restoring: tabs waiting for their connection to come up.
+    pub restore_pending: Vec<crate::store::SavedTab>,
 }
 
 impl AppCtx {
@@ -148,12 +178,34 @@ impl AppCtx {
         self.cmds.push(c);
     }
 
+    /// Connect what the offered tabs need, then open them as connections come up.
+    pub fn restore_session(&mut self) {
+        let tabs = std::mem::take(&mut self.restore_offer);
+        let mut conns: Vec<Uuid> = tabs.iter().map(|t| t.conn()).collect();
+        conns.dedup();
+        for c in conns {
+            if self.conns.session(c).is_none() && !self.conns.is_connecting(c) {
+                self.cmd(Cmd::Connect(c));
+            }
+        }
+        self.restore_pending = tabs;
+    }
+
+    /// Keep a closed tab so ⌘⇧T can bring it back (last 20).
+    pub fn remember_closed(&mut self, c: Cmd) {
+        self.closed_tabs.push(c);
+        if self.closed_tabs.len() > 20 {
+            self.closed_tabs.remove(0);
+        }
+    }
+
     pub fn profile_name(&self, id: Uuid) -> String {
         self.store.profile(id).map(|p| p.name.clone()).unwrap_or_else(|| "(deleted connection)".into())
     }
 
+    /// Production, or Staging when Settings asks for confirmation there too.
     pub fn is_production(&self, id: Uuid) -> bool {
-        self.store.profile(id).is_some_and(|p| p.environment.is_protected())
+        self.store.profile(id).is_some_and(|p| p.environment.is_protected() || (p.environment == openvclient_core::Environment::Staging && self.store.ws.settings.confirm_staging))
     }
 
     /// Ask before a destructive action. `name` must be typed on production.
@@ -216,6 +268,8 @@ pub enum TabKind {
     Resource(Box<views::resource::ResourceTab>),
     Terminal(Box<views::terminal::TerminalTab>),
     Files(Box<views::files::FilesTab>),
+    Erd(Box<views::erd::ErdTab>),
+    Compare(Box<views::compare::CompareTab>),
 }
 
 pub struct Tab {
@@ -224,6 +278,39 @@ pub struct Tab {
 }
 
 impl Tab {
+    /// What to save for reopening after a restart.
+    fn saved(&self) -> Option<crate::store::SavedTab> {
+        use crate::store::SavedTab as S;
+        Some(match &self.kind {
+            TabKind::Sql(t) => {
+                let (database, text) = t.reopen_parts();
+                S::Sql { conn: t.conn, database, text }
+            }
+            TabKind::Table(t) => S::Table { conn: t.conn, kind: t.kind, path: t.path.clone() },
+            TabKind::Monitor(t) => S::Monitor { conn: t.conn },
+            TabKind::Redis(t) => S::Redis { conn: t.conn, db: t.db },
+            _ => return None,
+        })
+    }
+
+    /// A command that opens this tab again after it is closed.
+    fn reopen_cmd(&self) -> Option<Cmd> {
+        Some(match &self.kind {
+            TabKind::Home => Cmd::OpenHome,
+            TabKind::Sql(t) => {
+                let (database, text) = t.reopen_parts();
+                Cmd::NewSql { conn: t.conn, database, text }
+            }
+            TabKind::Table(t) => Cmd::OpenTable { conn: t.conn, kind: t.kind, path: t.path.clone() },
+            TabKind::Monitor(t) => Cmd::OpenMonitor(t.conn),
+            TabKind::Users(t) => Cmd::OpenUsers(t.conn),
+            TabKind::Terminal(t) => Cmd::OpenTerminal(t.conn),
+            TabKind::Redis(t) => Cmd::OpenRedis { conn: t.conn, db: t.db },
+            TabKind::Docker(t) => Cmd::OpenDocker { conn: t.conn, section: t.section },
+            _ => return None,
+        })
+    }
+
     pub fn conn(&self) -> Option<Uuid> {
         match &self.kind {
             TabKind::Home => None,
@@ -237,6 +324,8 @@ impl Tab {
             TabKind::Resource(t) => Some(t.conn),
             TabKind::Terminal(t) => Some(t.conn),
             TabKind::Files(t) => Some(t.conn),
+            TabKind::Erd(t) => Some(t.conn),
+            TabKind::Compare(t) => Some(t.left.conn),
         }
     }
 
@@ -254,6 +343,8 @@ impl Tab {
             TabKind::Resource(t) => t.node.as_ref().map(|n| views::resource::node_icon(n.icon)).unwrap_or(ICON_DNS),
             TabKind::Terminal(_) => ICON_TERMINAL,
             TabKind::Files(_) => ICON_FOLDER_OPEN,
+            TabKind::Erd(_) => ICON_SCHEMA,
+            TabKind::Compare(_) => ICON_COMPARE_ARROWS,
         }
     }
 
@@ -274,6 +365,8 @@ impl Tab {
             },
             TabKind::Terminal(_) => ico(ICON_TERMINAL, &format!("Terminal · {conn}")),
             TabKind::Files(t) => ico(ICON_FOLDER_OPEN, &format!("{conn} · {}", t.title())),
+            TabKind::Erd(t) => ico(ICON_SCHEMA, &format!("{conn} · {}", t.title())),
+            TabKind::Compare(_) => ico(ICON_COMPARE_ARROWS, "Compare schemas"),
         }
     }
 
@@ -289,6 +382,8 @@ impl Tab {
             TabKind::Docker(t) => Some(format!("docker:{}", t.conn)),
             TabKind::Resource(t) => Some(format!("res:{}", t.conn)),
             TabKind::Files(t) => Some(format!("files:{}", t.conn)),
+            TabKind::Erd(t) => Some(format!("erd:{}:{:?}:{}", t.conn, t.database, t.schema)),
+            TabKind::Compare(_) => None,
             TabKind::Sql(_) | TabKind::Terminal(_) => None,
         }
     }
@@ -322,6 +417,8 @@ impl Behavior<Tab> for Viewer<'_> {
                 TabKind::Resource(t) => t.ui(ui, self.cx, id),
                 TabKind::Terminal(t) => t.ui(ui, self.cx),
                 TabKind::Files(t) => t.ui(ui, self.cx),
+                TabKind::Erd(t) => t.ui(ui, self.cx),
+                TabKind::Compare(t) => t.ui(ui, self.cx),
             }
         });
         UiResponse::None
@@ -376,11 +473,14 @@ impl Behavior<Tab> for Viewer<'_> {
         let title = if cartoon_glyph.is_some() { title.split_once("  ").map(|(_, rest)| rest.to_string()).unwrap_or(title) } else { title };
         let font = egui::FontId::proportional(13.5);
         let text_color = if state.active { t.fg } else { t.muted_fg };
-        let galley = ui.painter().layout_no_wrap(title, font, text_color);
+        // Long titles are cut with "…" so one tab cannot push the rest off-screen.
+        let full_title = title.clone();
+        let galley = crate::views::sidebar::elided(ui, &title, font, text_color, 260.0);
         let (pad, close) = (12.0, 18.0);
         let width = galley.size().x + pad * 2.0 + if state.closable { close + 6.0 } else { 0.0 } + if cartoon_glyph.is_some() { 24.0 } else { 0.0 };
         let (_, rect) = ui.allocate_space(egui::vec2(width, ui.available_height()));
         let resp = ui.interact(rect, id, egui::Sense::click_and_drag()).on_hover_cursor(egui::CursorIcon::PointingHand);
+        let resp = if galley.elided { resp.on_hover_text(&full_title) } else { resp };
         if !state.is_being_dragged {
             let bg = if state.active {
                 ui.visuals().panel_fill
@@ -416,12 +516,22 @@ impl Behavior<Tab> for Viewer<'_> {
                 if hot {
                     ui.painter().rect_filled(crect, 4.0, t.destructive.gamma_multiply(0.85));
                 }
-                let color = if hot { egui::Color32::WHITE } else { t.destructive.gamma_multiply(if state.active || resp.hovered() { 1.0 } else { 0.6 }) };
-                let r = crect.shrink(5.0);
-                let s = egui::Stroke::new(1.6, color);
-                ui.painter().line_segment([r.left_top(), r.right_bottom()], s);
-                ui.painter().line_segment([r.right_top(), r.left_bottom()], s);
+                // Quiet until it matters: muted on the active or hovered tab, hidden
+                // on the others, red only when the pointer is on it.
+                let show = hot || state.active || resp.hovered();
+                if show {
+                    let color = if hot { egui::Color32::WHITE } else { t.muted_fg };
+                    let r = crect.shrink(5.0);
+                    let s = egui::Stroke::new(1.6, color);
+                    ui.painter().line_segment([r.left_top(), r.right_bottom()], s);
+                    ui.painter().line_segment([r.right_top(), r.left_bottom()], s);
+                }
                 if (cresp.clicked() || resp.clicked_by(egui::PointerButton::Middle)) && self.on_tab_close(tiles, tile_id) {
+                    if let Some(Tile::Pane(p)) = tiles.get(tile_id)
+                        && let Some(c) = p.reopen_cmd()
+                    {
+                        self.cx.remember_closed(c);
+                    }
                     tiles.remove(tile_id);
                 }
             }
@@ -429,7 +539,46 @@ impl Behavior<Tab> for Viewer<'_> {
         if resp.clicked() {
             *self.focused = Some(tile_id);
         }
+        let reopen = !self.cx.closed_tabs.is_empty();
+        resp.context_menu(|ui| {
+            let mut act = |a| self.cx.tab_actions.push(a);
+            if ui.button("Close other tabs").clicked() {
+                act(TabAction::CloseOthers(tile_id));
+            }
+            if ui.button("Close tabs to the right").clicked() {
+                act(TabAction::CloseRight(tile_id));
+            }
+            if ui.button("Close all tabs").clicked() {
+                act(TabAction::CloseAll(tile_id));
+            }
+            ui.separator();
+            if ui.add_enabled(reopen, egui::Button::new("Reopen closed tab").shortcut_text(theme::kbd("⌘⇧T"))).clicked() {
+                act(TabAction::Reopen);
+            }
+        });
         self.on_tab_button(tiles, tile_id, resp)
+    }
+
+    /// A list of every tab in this strip, for when they no longer fit.
+    fn top_bar_right_ui(&mut self, tiles: &Tiles<Tab>, ui: &mut egui::Ui, _tile_id: TileId, tabs: &egui_tiles::Tabs, _scroll: &mut f32) {
+        if tabs.children.len() < 2 {
+            return;
+        }
+        ui.add_space(theme::space::XS);
+        ui.menu_button(String::from(ICON_EXPAND_MORE), |ui| {
+            ui.set_min_width(240.0);
+            for child in &tabs.children {
+                if let Some(Tile::Pane(p)) = tiles.get(*child) {
+                    let active = tabs.active == Some(*child);
+                    if ui.selectable_label(active, p.title(self.cx)).clicked() {
+                        self.cx.tab_actions.push(TabAction::Focus(*child));
+                        ui.close();
+                    }
+                }
+            }
+        })
+        .response
+        .on_hover_text("All open tabs");
     }
 
     fn simplification_options(&self) -> SimplificationOptions {
@@ -448,6 +597,8 @@ pub struct OpenvApp {
     /// Windows: whether the end-session hook has been attempted.
     #[cfg(windows)]
     session_hooked: bool,
+    /// Zoom factor last applied, to tell keyboard zoom from a Settings change.
+    applied_zoom: f32,
 }
 
 impl OpenvApp {
@@ -477,12 +628,25 @@ impl OpenvApp {
             show_settings: false,
             show_about: false,
             show_shortcuts: false,
+            sidebar_hidden: false,
             pending_sql: None,
             resource_jobs: HashMap::new(),
+            tab_actions: Vec::new(),
+            closed_tabs: Vec::new(),
+            restore_offer: Vec::new(),
+            restore_pending: Vec::new(),
             store,
         };
+        // Offer last session's tabs whose connection still exists.
+        let saved = std::mem::take(&mut cx.store.ws.session);
+        cx.restore_offer = saved.into_iter().filter(|t| cx.store.profile(t.conn()).is_some()).collect();
         if let Some(e) = cx.store.load_error.clone() {
-            cx.toasts.error_text("Workspace could not be loaded", e);
+            // A partly decrypted workspace still loaded; say so instead of "could not be loaded".
+            if e.contains("could not be decrypted") {
+                cx.toasts.warn("Some saved items were skipped", e);
+            } else {
+                cx.toasts.error_text("Workspace could not be loaded", e);
+            }
         }
         let tree = Tree::new_tabs(egui::Id::unique("workspace"), vec![Tab { id: 1, kind: TabKind::Home }]);
         Self {
@@ -493,6 +657,7 @@ impl OpenvApp {
             window_fitted: false,
             #[cfg(windows)]
             session_hooked: false,
+            applied_zoom: 1.0,
         }
     }
 
@@ -547,6 +712,11 @@ impl OpenvApp {
     fn close_where(&mut self, pred: impl Fn(&Tab) -> bool) {
         let ids: Vec<TileId> = self.tree.tiles.iter().filter_map(|(id, t)| matches!(t, Tile::Pane(p) if pred(p)).then_some(*id)).collect();
         for id in ids {
+            if let Some(Tile::Pane(p)) = self.tree.tiles.get(id)
+                && let Some(c) = p.reopen_cmd()
+            {
+                self.cx.remember_closed(c);
+            }
             if let Some(Tile::Pane(Tab { kind: TabKind::Sql(t), .. })) = self.tree.tiles.get_mut(id) {
                 t.close(&self.cx.bg);
             }
@@ -554,7 +724,53 @@ impl OpenvApp {
         }
     }
 
+    /// Apply tab-strip requests queued while drawing the tree.
+    fn apply_tab_actions(&mut self) {
+        for a in std::mem::take(&mut self.cx.tab_actions) {
+            let siblings = |tree: &Tree<Tab>, id: TileId| -> Vec<TileId> {
+                match tree.tiles.parent_of(id).and_then(|p| tree.tiles.get(p)) {
+                    Some(Tile::Container(Container::Tabs(t))) => t.children.clone(),
+                    _ => vec![id],
+                }
+            };
+            let pane_ids = |tree: &Tree<Tab>, ids: Vec<TileId>| -> Vec<u64> { ids.into_iter().filter_map(|i| if let Some(Tile::Pane(p)) = tree.tiles.get(i) { Some(p.id) } else { None }).collect() };
+            match a {
+                TabAction::Focus(id) => self.activate(id),
+                TabAction::Reopen => {
+                    if let Some(c) = self.cx.closed_tabs.pop() {
+                        self.cx.cmd(c);
+                    }
+                }
+                TabAction::CloseOthers(id) | TabAction::CloseRight(id) | TabAction::CloseAll(id) => {
+                    let all = siblings(&self.tree, id);
+                    let pos = all.iter().position(|c| *c == id).unwrap_or(0);
+                    let victims: Vec<TileId> = match a {
+                        TabAction::CloseOthers(_) => all.iter().copied().filter(|c| *c != id).collect(),
+                        TabAction::CloseRight(_) => all[pos + 1..].to_vec(),
+                        _ => all.clone(),
+                    };
+                    let ids = pane_ids(&self.tree, victims);
+                    self.close_where(|t| ids.contains(&t.id));
+                    if matches!(a, TabAction::CloseOthers(_) | TabAction::CloseRight(_)) {
+                        self.activate(id);
+                    }
+                }
+            }
+        }
+    }
+
     fn run_commands(&mut self) {
+        // Restored tabs open once their connection is ready; failed ones are dropped.
+        if !self.cx.restore_pending.is_empty() {
+            let pending = std::mem::take(&mut self.cx.restore_pending);
+            for t in pending {
+                match self.cx.conns.state(t.conn()) {
+                    Some(ConnState::Connected(_)) => self.cx.cmd(t.into_cmd()),
+                    Some(ConnState::Failed(_)) => {}
+                    _ => self.cx.restore_pending.push(t),
+                }
+            }
+        }
         let cmds = std::mem::take(&mut self.cx.cmds);
         for c in cmds {
             match c {
@@ -567,6 +783,8 @@ impl OpenvApp {
                     self.open(TabKind::Table(Box::new(t)));
                 }
                 Cmd::OpenObject { conn, kind, path } => self.open(TabKind::Object(Box::new(views::object::ObjectTab::new(conn, kind, path)))),
+                Cmd::OpenErd { conn, database, schema } => self.open(TabKind::Erd(Box::new(views::erd::ErdTab::new(conn, database, schema)))),
+                Cmd::OpenCompare { conn, database, schema } => self.open(TabKind::Compare(Box::new(views::compare::CompareTab::new(conn, database, schema)))),
                 Cmd::OpenMonitor(conn) => self.open(TabKind::Monitor(Box::new(views::monitor::MonitorTab::new(conn)))),
                 Cmd::OpenUsers(conn) => self.open(TabKind::Users(Box::new(views::users::UsersTab::new(conn)))),
                 Cmd::OpenTerminal(conn) => self.open(TabKind::Terminal(Box::new(views::terminal::TerminalTab::new(conn)))),
@@ -704,6 +922,28 @@ impl OpenvApp {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let cmd = |k| KeyboardShortcut::new(Modifiers::COMMAND, k);
+        let (reopen, nth) = ctx.input_mut(|i| {
+            let reopen = i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::T));
+            let keys = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
+            let nth = keys.iter().position(|k| i.consume_shortcut(&cmd(*k)));
+            (reopen, nth)
+        });
+        if reopen {
+            self.cx.tab_actions.push(TabAction::Reopen);
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&cmd(Key::B))) {
+            self.cx.sidebar_hidden = !self.cx.sidebar_hidden;
+        }
+        if let Some(n) = nth {
+            // ⌘1…⌘8 pick that tab in the focused strip; ⌘9 picks the last one.
+            let strip = self.focused.and_then(|f| self.tree.tiles.parent_of(f)).or_else(|| self.tree.tiles.iter().find_map(|(id, t)| matches!(t, Tile::Container(Container::Tabs(_))).then_some(*id)));
+            if let Some(Tile::Container(Container::Tabs(t))) = strip.and_then(|s| self.tree.tiles.get(s)) {
+                let target = if n == 8 { t.children.last().copied() } else { t.children.get(n).copied() };
+                if let Some(id) = target {
+                    self.cx.tab_actions.push(TabAction::Focus(id));
+                }
+            }
+        }
         let (palette, new_conn, new_sql, close, home, keys) = ctx.input_mut(|i| {
             (
                 i.consume_shortcut(&cmd(Key::K)) || i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::P)),
@@ -768,7 +1008,12 @@ impl OpenvApp {
                 ui.add_space(theme::space::XS);
                 theme::brand_mark(ui, 26.0);
                 theme::wordmark(ui, 16.0);
-                ui.add_space(theme::space::LG);
+                ui.add_space(theme::space::SM);
+                let (g, tip) = if self.cx.sidebar_hidden { (ICON_LEFT_PANEL_OPEN, "Show sidebar (⌘B)") } else { (ICON_LEFT_PANEL_CLOSE, "Hide sidebar (⌘B)") };
+                if ui.button(String::from(g)).on_hover_text(theme::kbd(tip)).clicked() {
+                    self.cx.sidebar_hidden = !self.cx.sidebar_hidden;
+                }
+                ui.add_space(theme::space::SM);
                 let search = ui.add_sized(
                     [340.0, 26.0],
                     egui::Button::new(RichText::new(format!("{}   Search connections, tables, commands…   {}", String::from(ICON_SEARCH), theme::kbd("⌘K"))).color(theme::muted(ui))),
@@ -805,7 +1050,7 @@ impl OpenvApp {
                 let focused = self.focused_conn();
                 if let Some(c) = focused {
                     if let Some(p) = self.cx.store.profile(c) {
-                        theme::badge(ui, p.environment.short(), theme::env_color(ui, p.environment));
+                        theme::badge(ui, p.environment.short(), theme::env_color(ui, p.environment)).on_hover_text(crate::views::env_tip(p.environment));
                         ui.label(RichText::new(&p.name).small());
                     }
                     match self.cx.conns.state(c) {
@@ -834,6 +1079,14 @@ impl OpenvApp {
                     let running = self.cx.bg.running();
                     let n = self.cx.conns.connected_ids().len();
                     ui.label(RichText::new(format!("{n} connected")).small().color(t.muted_fg));
+                    // Cursor position of the focused SQL editor.
+                    if let Some(Tile::Pane(Tab { kind: TabKind::Sql(st), .. })) = self.focused.and_then(|f| self.tree.tiles.get(f))
+                        && let Some((line, col, sel)) = st.cursor_position()
+                    {
+                        ui.separator();
+                        let txt = if sel > 0 { format!("Ln {line}, Col {col} ({sel} selected)") } else { format!("Ln {line}, Col {col}") };
+                        ui.label(RichText::new(txt).small().color(t.muted_fg));
+                    }
                     for task in running.iter().take(3) {
                         ui.separator();
                         if ui.small_button(String::from(ICON_CLOSE)).on_hover_text("Cancel").clicked() {
@@ -1108,6 +1361,7 @@ impl OpenvApp {
         let mut close = false;
         let mut check_now = false;
         let mut open_keys = false;
+        let (mut export_ws, mut import_ws) = (false, false);
         let before = self.cx.store.ws.settings.clone();
         egui::Modal::new(egui::Id::unique("settings")).show(ctx, |ui| {
             ui.set_width(640.0_f32.min(ctx.content_rect().width() - 48.0));
@@ -1179,6 +1433,10 @@ impl OpenvApp {
                         check_now = true;
                     }
                 });
+                row(ui, "Interface size", &theme::kbd("Whole app; also ⌘= and ⌘−"), &mut |ui| {
+                    ui.spacing_mut().slider_width = 220.0;
+                    ui.add(egui::Slider::new(&mut s.ui_zoom, 0.7..=1.6).step_by(0.05).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
+                });
                 row(ui, "Scroll speed", "Multiplier for mouse wheel and trackpad scrolling", &mut |ui| {
                     ui.spacing_mut().slider_width = 220.0;
                     ui.add(egui::Slider::new(&mut s.scroll_speed, 0.2..=2.0).step_by(0.05).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
@@ -1191,10 +1449,22 @@ impl OpenvApp {
                 row(ui, "Table page size", "Rows per page in the table browser", &mut |ui| {
                     ui.add(egui::DragValue::new(&mut s.page_size).range(10..=10_000).speed(10));
                 });
+                row(ui, "NULL shown as", "How empty (NULL) cells read in grids", &mut |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut s.null_display).desired_width(120.0).char_limit(12));
+                });
+                row(ui, "Timestamps", "Copy and export always keep the full value", &mut |ui| {
+                    ui.checkbox(&mut s.short_timestamps, "Hide fractional seconds in grids");
+                });
                 ui.add_space(theme::space::SM);
                 ui.label(RichText::new("SAFETY").small().strong().color(t.muted_fg));
                 row(ui, "Production", "", &mut |ui| {
                     ui.checkbox(&mut s.confirm_production, "Type the name to confirm destructive actions");
+                });
+                row(ui, "Staging", "Off: Staging connections only show their badge", &mut |ui| {
+                    ui.checkbox(&mut s.confirm_staging, "Ask the same way on Staging connections");
+                });
+                row(ui, "Query timeout", "Cancel a SQL run that takes longer; 0 = never", &mut |ui| {
+                    ui.add(egui::DragValue::new(&mut s.query_timeout_secs).range(0..=86_400).speed(1).suffix(" s"));
                 });
                 ui.add_space(theme::space::SM);
                 ui.label(RichText::new("HELP").small().strong().color(t.muted_fg));
@@ -1210,6 +1480,15 @@ impl OpenvApp {
                 let logs = crate::store::config_dir().join("logs");
                 ui.add(egui::Label::new(RichText::new(format!("Logs: {}", logs.display())).small().color(t.muted_fg)).wrap());
                 ui.horizontal(|ui| {
+                    if ui.small_button(ico(ICON_FOLDER_OPEN, "Show workspace folder")).clicked() {
+                        crate::update::open_url(&crate::store::config_dir().display().to_string());
+                    }
+                    if ui.small_button(ico(ICON_UPLOAD_FILE, "Export connections…")).on_hover_text("Saves connections (no passwords) to a file").clicked() {
+                        export_ws = true;
+                    }
+                    if ui.small_button(ico(ICON_DOWNLOAD, "Import connections…")).on_hover_text("Adds connections from an exported file").clicked() {
+                        import_ws = true;
+                    }
                     if ui.small_button(ico(ICON_FOLDER_OPEN, "Open logs folder")).clicked() {
                         // The folder may not exist yet (nothing logged); file managers
                         // then open somewhere unrelated, so create it first.
@@ -1225,6 +1504,12 @@ impl OpenvApp {
         if check_now {
             self.cx.check_updates(true);
         }
+        if export_ws {
+            self.export_workspace();
+        }
+        if import_ws {
+            self.import_workspace();
+        }
         if open_keys {
             self.cx.show_shortcuts = true;
             self.cx.show_settings = false;
@@ -1234,6 +1519,44 @@ impl OpenvApp {
         }
         if format!("{:?}", before) != format!("{:?}", self.cx.store.ws.settings) {
             self.cx.mark_dirty();
+        }
+    }
+
+    /// Zoom and grid display options from Settings. Keyboard zoom (⌘=/⌘−)
+    /// changes egui's factor directly; keep the setting in step with it.
+    fn apply_display_settings(&mut self, ctx: &egui::Context) {
+        let s = &mut self.cx.store.ws.settings;
+        let z = ctx.zoom_factor();
+        if (z - self.applied_zoom).abs() > 0.001 {
+            // Changed with the keyboard.
+            s.ui_zoom = z;
+            self.applied_zoom = z;
+            self.cx.dirty = true;
+        } else if (s.ui_zoom - z).abs() > 0.001 {
+            let target = s.ui_zoom.clamp(0.5, 2.0);
+            ctx.set_zoom_factor(target);
+            self.applied_zoom = target;
+        }
+        crate::widgets::grid::set_display(&s.null_display, s.short_timestamps);
+    }
+
+    fn export_workspace(&mut self) {
+        let Some(path) = rfd::FileDialog::new().add_filter("JSON", &["json"]).set_file_name("openvclient-connections.json").save_file() else { return };
+        match self.cx.store.export_profiles(&path) {
+            Ok(n) => self.cx.toasts.info(format!("Exported {n} connections"), format!("{}\nPasswords stay in this computer's keychain.", path.display())),
+            Err(e) => self.cx.toasts.error_text("Export failed", e),
+        }
+    }
+
+    fn import_workspace(&mut self) {
+        let Some(path) = rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() else { return };
+        match self.cx.store.import_profiles(&path) {
+            Ok((added, skipped)) => {
+                self.cx.mark_dirty();
+                let body = if skipped > 0 { format!("{skipped} already existed and were left as they are.") } else { "Passwords are asked for on first connect.".into() };
+                self.cx.toasts.info(format!("Imported {added} connections"), body);
+            }
+            Err(e) => self.cx.toasts.error_text("Import failed", e),
         }
     }
 
@@ -1383,12 +1706,15 @@ impl eframe::App for OpenvApp {
         self.handle_events();
         self.poll_updates(&ctx);
         self.shortcuts(&ctx);
+        self.apply_display_settings(&ctx);
 
         self.top_bar(ui);
         self.status_bar(ui);
-        egui::Panel::left("sidebar").resizable(true).default_size(290.0).size_range(200.0..=560.0).show(ui, |ui| {
-            views::sidebar::ui(ui, &mut self.cx);
-        });
+        if !self.cx.sidebar_hidden {
+            egui::Panel::left("sidebar").resizable(true).default_size(290.0).size_range(200.0..=560.0).show(ui, |ui| {
+                views::sidebar::ui(ui, &mut self.cx);
+            });
+        }
         egui::CentralPanel::default().frame(egui::Frame::new().fill(ui.visuals().extreme_bg_color)).show(ui, |ui| {
             if self.tree.root.is_none() {
                 self.tree = Tree::new_tabs(egui::Id::unique("workspace"), vec![Tab { id: self.cx.tab_id(), kind: TabKind::Home }]);
@@ -1396,6 +1722,7 @@ impl eframe::App for OpenvApp {
             let mut viewer = Viewer { cx: &mut self.cx, focused: &mut self.focused };
             self.tree.ui(&mut viewer, ui);
         });
+        self.apply_tab_actions();
 
         if let Some(mut d) = self.cx.conn_dialog.take()
             && d.show(&ctx, &mut self.cx)
@@ -1437,6 +1764,13 @@ impl eframe::App for OpenvApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Remember open tabs (in strip order) for "Pick up where you left off".
+        let mut saved: Vec<crate::store::SavedTab> = self.tree.tiles.iter().filter_map(|(_, t)| if let Tile::Pane(p) = t { p.saved() } else { None }).collect();
+        // Not yet restored? Keep the earlier offer rather than losing it.
+        if saved.is_empty() {
+            saved = std::mem::take(&mut self.cx.restore_offer);
+        }
+        self.cx.store.ws.session = saved;
         if let Err(e) = self.cx.store.save() {
             tracing::error!("saving workspace on exit failed: {e}");
         }
@@ -1480,6 +1814,31 @@ mod walkthrough {
     /// Demo Postgres database; override with OPENVCLIENT_DEMO_DB.
     fn demo_db() -> String {
         std::env::var("OPENVCLIENT_DEMO_DB").unwrap_or_else(|_| "openv_demo".into())
+    }
+
+    /// A valid one-page PDF with a title, built with correct xref offsets.
+    fn tiny_pdf(title: &str) -> Vec<u8> {
+        let stream = format!("BT /F1 28 Tf 60 720 Td ({title}) Tj ET\n0.13 0.77 0.37 rg 60 420 80 200 re f 160 420 80 120 re f 260 420 80 260 re f 360 420 80 160 re f\n");
+        let objs = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>".to_string(),
+            format!("<< /Length {} >>\nstream\n{stream}endstream", stream.len()),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        ];
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offs = Vec::new();
+        for (i, o) in objs.iter().enumerate() {
+            offs.push(out.len());
+            out.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
+        }
+        let xref = out.len();
+        out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+        for o in offs {
+            out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).as_bytes());
+        out
     }
 
     fn id_of(app: &OpenvApp, name: &str) -> Uuid {
@@ -1563,6 +1922,19 @@ mod walkthrough {
         std::thread::sleep(Duration::from_millis(300));
         settle(&mut h, |a| a.cx.bg.running().is_empty(), Duration::from_secs(10));
         shot(&mut h, &out, "05-table");
+        {
+            let app = h.state_mut();
+            if let Some(Tile::Pane(Tab { kind: TabKind::Table(t), .. })) = app.focused.and_then(|f| app.tree.tiles.get_mut(f)) {
+                t.grid.frozen = 2;
+            }
+        }
+        shot(&mut h, &out, "05b-frozen-columns");
+        {
+            let app = h.state_mut();
+            if let Some(Tile::Pane(Tab { kind: TabKind::Table(t), .. })) = app.focused.and_then(|f| app.tree.tiles.get_mut(f)) {
+                t.grid.frozen = 0;
+            }
+        }
 
         // Monitoring.
         h.state_mut().cx.cmd(Cmd::OpenMonitor(pg));
@@ -1628,12 +2000,70 @@ mod walkthrough {
         shot(&mut h, &out, "13b-about");
         h.state_mut().cx.show_about = false;
         h.state_mut().cx.show_settings = false;
+
+        // New features: ER diagram, schema compare, chart, formatter, session restore.
+        h.state_mut().cx.cmd(Cmd::OpenErd { conn: pg, database: Some(demo_db()), schema: "sales".into() });
+        for _ in 0..4 {
+            h.step();
+        }
+        settle(&mut h, |a| a.cx.bg.running().is_empty(), Duration::from_secs(10));
+        shot(&mut h, &out, "15-erd");
+        h.state_mut().cx.cmd(Cmd::OpenCompare { conn: pg, database: Some(demo_db()), schema: "sales".into() });
+        for _ in 0..3 {
+            h.step();
+        }
+        {
+            let app = h.state_mut();
+            if let Some(tid) = app.find(|t| matches!(t.kind, TabKind::Compare(_)))
+                && let Some(Tile::Pane(Tab { kind: TabKind::Compare(c), .. })) = app.tree.tiles.get_mut(tid)
+            {
+                c.right.schema = "public".into();
+                c.start(&mut app.cx);
+            }
+        }
+        for _ in 0..4 {
+            h.step();
+        }
+        settle(&mut h, |a| a.cx.bg.running().is_empty(), Duration::from_secs(10));
+        shot(&mut h, &out, "16-compare");
+        let messy = "select c.country, count(*) as orders, round(sum(o.amount),2) as revenue from sales.orders o join sales.customers c on c.id=o.customer_id where o.status='shipped' and o.amount>10 group by 1 order by revenue desc;";
+        h.state_mut().cx.cmd(Cmd::NewSql { conn: pg, database: Some(demo_db()), text: messy.into() });
+        std::thread::sleep(Duration::from_millis(600));
+        for _ in 0..10 {
+            h.step();
+        }
+        {
+            let app = h.state_mut();
+            if let Some(Tile::Pane(Tab { kind: TabKind::Sql(t), .. })) = app.focused.and_then(|f| app.tree.tiles.get_mut(f)) {
+                t.test_format_and_chart(&mut app.cx, true, false);
+            }
+        }
+        h.key_press_modifiers(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Enter);
+        settle(&mut h, |a| a.cx.bg.running().is_empty(), Duration::from_secs(10));
+        shot(&mut h, &out, "17-formatted");
+        {
+            let app = h.state_mut();
+            if let Some(Tile::Pane(Tab { kind: TabKind::Sql(t), .. })) = app.focused.and_then(|f| app.tree.tiles.get_mut(f)) {
+                t.test_format_and_chart(&mut app.cx, false, true);
+            }
+        }
+        shot(&mut h, &out, "18-chart");
+        {
+            let app = h.state_mut();
+            app.cx.restore_offer = vec![crate::store::SavedTab::Sql { conn: pg, database: Some(demo_db()), text: "SELECT 1".into() }, crate::store::SavedTab::Monitor { conn: pg }];
+        }
         apply_theme(&h.ctx, ThemeChoice::Light);
         h.state_mut().cx.cmd(Cmd::OpenHome);
         for _ in 0..6 {
             h.step();
         }
         shot(&mut h, &out, "14-home-light");
+        h.state_mut().cx.store.ws.settings.home_by_folder = true;
+        for _ in 0..4 {
+            h.step();
+        }
+        shot(&mut h, &out, "14b-home-by-folder");
+        h.state_mut().cx.store.ws.settings.home_by_folder = false;
         drop(h);
         rt.shutdown_timeout(Duration::from_secs(1));
     }
@@ -1678,7 +2108,8 @@ mod walkthrough {
         // Seed: a container with folders and a few typical files.
         let dir = std::env::temp_dir().join("ovc-files-shots");
         std::fs::create_dir_all(&dir).unwrap();
-        let files = [("alert_dump_01.00.parquet", 1_089_246), ("asset_dump_01.00.parquet", 742_311), ("summary.json", 2_048), ("readme.txt", 512), ("export.csv", 96_000)];
+        let files =
+            [("alert_dump_01.00.parquet", 1_089_246), ("asset_dump_01.00.parquet", 742_311), ("summary.json", 2_048), ("readme.txt", 512), ("export.csv", 96_000), ("chart.png", 0), ("report.pdf", 0)];
         rt.block_on(async {
             let mut a = Args::new();
             a.insert("name".into(), "analytics-exports".into());
@@ -1694,6 +2125,18 @@ mod walkthrough {
                     r#"{"alerts": 128, "assets": 3402, "generated": "2026-02-24T12:43:17Z"}"#.as_bytes().to_vec()
                 } else if name.ends_with(".txt") {
                     b"Daily export from the analytics pipeline.\n".to_vec()
+                } else if name.ends_with(".pdf") {
+                    tiny_pdf("Monthly analytics report")
+                } else if name.ends_with(".png") {
+                    // A small generated chart, so the image preview has something to show.
+                    let img = image::RgbaImage::from_fn(320, 180, |x, y| {
+                        let bar = x / 40;
+                        let h = 40 + (bar * 37) % 130;
+                        if 180 - y < h && x % 40 > 6 { image::Rgba([34, 197, 94, 255]) } else { image::Rgba([241, 245, 249, 255]) }
+                    });
+                    let mut buf = std::io::Cursor::new(Vec::new());
+                    img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+                    buf.into_inner()
                 } else {
                     vec![b'x'; size]
                 };
@@ -1733,6 +2176,36 @@ mod walkthrough {
         }
         settle(&mut h, |a| a.cx.bg.running().is_empty(), Duration::from_secs(10));
         shot(&mut h, &out, "f3-files-preview");
+        {
+            let app = h.state_mut();
+            if let Some(tid) = app.find(|t| matches!(t.kind, TabKind::Files(_)))
+                && let Some(Tile::Pane(Tab { kind: TabKind::Files(f), .. })) = app.tree.tiles.get_mut(tid)
+            {
+                f.click_name(&app.cx, "chart.png");
+            }
+        }
+        for _ in 0..4 {
+            h.step();
+        }
+        settle(&mut h, |a| a.cx.bg.running().is_empty(), Duration::from_secs(10));
+        shot(&mut h, &out, "f3b-image-preview");
+        {
+            let app = h.state_mut();
+            if let Some(tid) = app.find(|t| matches!(t.kind, TabKind::Files(_)))
+                && let Some(Tile::Pane(Tab { kind: TabKind::Files(f), .. })) = app.tree.tiles.get_mut(tid)
+            {
+                f.click_name(&app.cx, "report.pdf");
+            }
+        }
+        for _ in 0..4 {
+            h.step();
+        }
+        settle(&mut h, |a| a.cx.bg.running().is_empty(), Duration::from_secs(15));
+        for _ in 0..4 {
+            h.step();
+        }
+        settle(&mut h, |a| a.cx.bg.running().is_empty(), Duration::from_secs(15));
+        shot(&mut h, &out, "f3c-pdf-preview");
         h.state_mut().cx.store.ws.settings.theme = crate::store::ThemeChoice::Light;
         apply_theme(&h.ctx, crate::store::ThemeChoice::Light);
         shot(&mut h, &out, "f4-files-light");
