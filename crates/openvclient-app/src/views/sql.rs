@@ -332,6 +332,14 @@ impl SqlTab {
             };
         }
         if let Some(mut res) = poll(&mut self.run) {
+            // USE switched the session's database: retitle the tab and reload autocomplete.
+            if res.iter().any(|r| r.outcome.is_ok() && leading_keyword(&r.sql) == "USE")
+                && let Some(db) = self.console().and_then(|c| c.current_database())
+                && self.database.as_deref() != Some(db.as_str())
+            {
+                self.database = Some(db);
+                cx.cmd(Cmd::InvalidateCatalog(self.conn));
+            }
             // The BEGIN we added is bookkeeping, not a result worth a tab.
             if res.len() > 1 && res[0].outcome.is_ok() && res[0].sql == tx_sql(self.dialect, "BEGIN") {
                 res.remove(0);

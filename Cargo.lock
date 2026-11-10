@@ -4732,6 +4732,7 @@ dependencies = [
  "parking_lot 0.13.0",
  "reqwest",
  "serde_json",
+ "socket2",
  "tiberius",
  "tokio",
  "tokio-util",
