@@ -176,3 +176,51 @@ async fn auth_method_validation() {
         assert!(e.message.contains("Windows build"), "{e}");
     }
 }
+
+/// USE switches the console's database; a real Cancel says "cancelled", while
+/// a session that dies on its own (network drop, someone else's KILL) says the
+/// connection was lost, not "cancelled".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn console_use_cancel_and_lost_connection() {
+    let s = match SqlServerDriver::default().connect(params("master")).await {
+        Ok(h) => h.sql().unwrap().clone(),
+        Err(e) => {
+            eprintln!("skipping: no SQL Server ({e})");
+            return;
+        }
+    };
+    let c = s.open_console(Some("master".into())).await.unwrap();
+    let r = c.execute(vec!["USE tempdb".into(), "SELECT DB_NAME() AS db".into()], ExecOptions { max_rows: 10 }).await;
+    assert!(r.iter().all(|x| x.outcome.is_ok()), "{:?}", r.iter().map(|x| x.outcome.as_ref().err()).collect::<Vec<_>>());
+    assert_eq!(c.current_database().as_deref(), Some("tempdb"));
+
+    // Cancel during a long statement.
+    let c2 = c.clone();
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        c2.cancel();
+    });
+    let r = c.execute(vec!["WAITFOR DELAY '00:00:30'".into()], ExecOptions { max_rows: 10 }).await;
+    canceller.await.unwrap();
+    let e = r[0].outcome.as_ref().expect_err("cancelled");
+    assert_eq!(e.kind, openvclient_core::ErrorKind::Cancelled, "{e}");
+
+    // The session is ended from elsewhere without Cancel: not "cancelled".
+    let spid = match c.execute(vec!["SELECT CAST(@@SPID AS int)".into()], ExecOptions { max_rows: 1 }).await.remove(0).outcome {
+        Ok(StatementOutcome::Rows(rs)) => rs.rows[0][0].to_text().unwrap(),
+        other => panic!("{other:?}"),
+    };
+    let killer = s.clone();
+    let k = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        killer.run(Some("master"), &format!("KILL {spid}")).await.unwrap();
+    });
+    let r = c.execute(vec!["WAITFOR DELAY '00:00:30'".into()], ExecOptions { max_rows: 10 }).await;
+    k.await.unwrap();
+    let e = r[0].outcome.as_ref().expect_err("lost");
+    assert_ne!(e.kind, openvclient_core::ErrorKind::Cancelled, "{e}");
+    assert!(e.message.contains("connection to the server was lost"), "{e}");
+    // And the next run opens a fresh session.
+    let r = c.execute(vec!["SELECT 1 AS one".into()], ExecOptions { max_rows: 1 }).await;
+    assert!(r[0].outcome.is_ok(), "{:?}", r[0].outcome);
+}

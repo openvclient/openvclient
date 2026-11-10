@@ -1976,6 +1976,23 @@ mod walkthrough {
             h.step();
         }
         shot(&mut h, &out, "10-connection-dialog");
+        // A long SQL Server-style failure must wrap inside the dialog, not widen it off-screen.
+        if let Some(d) = h.state_mut().cx.conn_dialog.as_mut() {
+            d.set_test_error(
+                openvclient_core::Error::connection(format!(
+                    "Login failed for user 'sa'. Reason: Could not find a login matching the name provided. [CLIENT: 10.0.0.12] {}",
+                    "Additional detail from the TLS layer and the TDS pre-login handshake. ".repeat(6)
+                ))
+                .with_detail(
+                    "tiberius::error::Error::Server(TokenError { code: 18456, state: 5, class: 14, message: \"Login failed for user 'sa'.\", server: \"mssql-prod-01\", procedure: \"\", line: 1 })\n"
+                        .repeat(12),
+                ),
+            );
+        }
+        for _ in 0..4 {
+            h.step();
+        }
+        shot(&mut h, &out, "10b-connection-error");
         h.state_mut().cx.conn_dialog = None;
         h.state_mut().cx.palette.open();
         h.state_mut().cx.palette.set_query("ord");

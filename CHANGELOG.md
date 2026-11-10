@@ -4,6 +4,16 @@ All notable changes to OpenVClient are listed here. The project follows
 [Semantic Versioning](https://semver.org); pre-releases are tagged
 `vX.Y.Z-beta.N` and published as GitHub pre-releases.
 
+## [1.0.0-beta.6] — 2026-11-10
+
+Notes: [docs/release-notes/v1.0.0-beta.6.md](docs/release-notes/v1.0.0-beta.6.md).
+
+### Fixed
+- SQL Server: long-running statements were dropped by idle network timeouts; TCP keepalives on SQL Server, PostgreSQL and MySQL connections.
+- SQL Server: a lost connection is no longer reported as "Cancelled".
+- SQL Server: `USE <database>` switches the editor's database (a new session on Azure SQL Database, which refuses `USE`).
+- A failed connection test no longer stretches the connection dialog off-screen.
+
 ## [1.0.0-beta.5] — 2026-11-07
 
 Notes: [docs/release-notes/v1.0.0-beta.5.md](docs/release-notes/v1.0.0-beta.5.md).

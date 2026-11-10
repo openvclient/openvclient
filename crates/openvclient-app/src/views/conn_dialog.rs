@@ -33,6 +33,8 @@ pub struct ConnDialog {
     url: String,
     /// Footer Cancel was pressed.
     cancelled: bool,
+    /// A new test result arrived: scroll it into view once.
+    reveal_result: bool,
 }
 
 /// A connection URL split into the form's fields.
@@ -142,6 +144,7 @@ impl ConnDialog {
                     proxy_password: String::new(),
                     url: String::new(),
                     cancelled: false,
+                    reveal_result: false,
                 }
             }
         }
@@ -174,7 +177,15 @@ impl ConnDialog {
             proxy_password: String::new(),
             url: String::new(),
             cancelled: false,
+            reveal_result: false,
         }
+    }
+
+    /// Test hook: show a failed connection test.
+    #[cfg(test)]
+    pub fn set_test_error(&mut self, e: Error) {
+        self.test_result = Some(Err(e));
+        self.reveal_result = true;
     }
 
     /// Skip the picker and open the form for `driver`.
@@ -219,12 +230,16 @@ impl ConnDialog {
         let mut close = false;
         if let Some(r) = poll(&mut self.test) {
             self.test_result = Some(r);
+            self.reveal_result = true;
         }
         let title = if self.is_new { "New connection" } else { "Edit connection" };
         egui::Modal::new(egui::Id::unique("conn_dialog")).show(ctx, |ui| {
             // Large enough that most forms fit without scrolling, never wider than the window.
             let screen = ctx.content_rect();
-            ui.set_width((if self.picking { 900.0_f32 } else { 820.0 }).min(screen.width() - 48.0));
+            let w = (if self.picking { 900.0_f32 } else { 820.0 }).min(screen.width() - 48.0);
+            ui.set_width(w);
+            // Content (e.g. a long error) must wrap rather than widen the dialog.
+            ui.set_max_width(w);
             ui.horizontal(|ui| {
                 ui.heading(title);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -460,6 +475,10 @@ impl ConnDialog {
             }
             Some(Err(e)) => {
                 crate::views::error_box(ui, e);
+                // On short windows the result sits below the fold; bring it into view.
+                if std::mem::take(&mut self.reveal_result) {
+                    ui.scroll_to_cursor(Some(egui::Align::Center));
+                }
                 if let Some(fp) = openvclient_net::unknown_host_key(e) {
                     let param = if e.message.contains("(jump host)") { "jump_fingerprint" } else { openvclient_net::keys::SSH_FINGERPRINT };
                     let t = theme::tokens(ui);

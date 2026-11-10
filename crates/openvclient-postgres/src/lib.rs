@@ -101,6 +101,9 @@ impl PgTarget {
             "require" | "verify-full" | "verify-ca" => SslMode::Require,
             _ => SslMode::Prefer,
         });
+        // Long statements send nothing until they finish; keepalives stop idle
+        // firewalls and NAT from dropping the connection mid-query.
+        c.keepalives(true).keepalives_idle(Duration::from_secs(30));
         if let Some(pw) = &self.password {
             c.password(pw);
         }

@@ -148,6 +148,14 @@ impl Target {
                 TcpStream::connect(c.get_addr()).await.map_err(|e| Error::connection(format!("{}: {e}", c.get_addr())))?
             };
             tcp.set_nodelay(true).ok();
+            // A long statement (DBCC SHRINKFILE, index rebuilds, big UPDATEs) sends
+            // nothing until it finishes; firewalls, NAT and cloud load balancers
+            // (Azure: 4 minutes) drop such idle connections, which ended the
+            // query. TCP keepalives keep the path open, like SSMS does.
+            let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(30)).with_interval(Duration::from_secs(10));
+            if let Err(e) = socket2::SockRef::from(&tcp).set_tcp_keepalive(&ka) {
+                tracing::debug!(target: "openvclient::conn", error = %e, "could not enable TCP keepalive");
+            }
             Client::connect(c, tcp.compat_write()).await.map_err(ms_err)
         };
         // Device-code sign-in waits for the user, so it gets the full sign-in window.
@@ -534,6 +542,7 @@ impl SqlSession for MsSession {
             database: Mutex::new(db),
             rt: tokio::runtime::Handle::current(),
             suspect: Default::default(),
+            cancel_requested: Default::default(),
         }))
     }
 
@@ -738,6 +747,25 @@ struct MsConsole {
     rt: tokio::runtime::Handle,
     /// Set after any error; the next run checks the session is still alive.
     suspect: std::sync::atomic::AtomicBool,
+    /// The user pressed Cancel (or the query timeout fired) for the current run.
+    cancel_requested: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The database named by a plain `USE x` statement, unquoted.
+fn use_target(sql: &str) -> Option<String> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let rest = s.get(..4).filter(|p| p.eq_ignore_ascii_case("use ")).map(|_| s[4..].trim())?;
+    let name = if let Some(r) = rest.strip_prefix('[') {
+        r.strip_suffix(']')?.replace("]]", "]")
+    } else if let Some(r) = rest.strip_prefix('"') {
+        r.strip_suffix('"')?.replace("\"\"", "\"")
+    } else {
+        if rest.contains(char::is_whitespace) {
+            return None;
+        }
+        rest.to_string()
+    };
+    (!name.is_empty()).then_some(name)
 }
 
 impl MsConsole {
@@ -780,6 +808,7 @@ impl SqlConsole for MsConsole {
             return out;
         }
         let mut slot = self.conn.lock().await;
+        self.cancel_requested.store(false, std::sync::atomic::Ordering::SeqCst);
         let mut out = Vec::new();
         for sql in statements {
             let t = Instant::now();
@@ -790,9 +819,29 @@ impl SqlConsole for MsConsole {
                 if let Err(e) = &r {
                     self.suspect.store(true, std::sync::atomic::Ordering::Relaxed);
                     if e.is_connection() {
-                        // Killed or dropped: a new session opens on the next run.
+                        // A new session opens on the next run either way; say
+                        // which happened, so a dropped link is not shown as "Cancelled".
                         *slot = None;
-                        return Err(Error::cancelled().with_detail("The session ended (cancel on SQL Server uses KILL). A new session opens on the next run."));
+                        if self.cancel_requested.load(std::sync::atomic::Ordering::SeqCst) {
+                            return Err(Error::cancelled().with_detail("Cancelled. SQL Server has no per-statement cancel, so the session was ended (KILL); a new session opens on the next run."));
+                        }
+                        let mins = t.elapsed().as_secs() / 60;
+                        let after = if mins > 0 { format!(" after {mins} min") } else { String::new() };
+                        return Err(Error::connection(format!("The connection to the server was lost while the statement ran{after}."))
+                            .with_detail(format!("{}\n\nThe statement may have finished on the server. Check before running it again. A new session opens on the next run.", e.message)));
+                    }
+                    // Azure SQL Database (and some proxies) refuse USE; open a
+                    // session on that database instead, as SSMS's database picker does.
+                    if let Some(db) = use_target(&sql)
+                        && (e.message.contains("40508") || e.message.to_lowercase().contains("use statement is not supported"))
+                    {
+                        let mut fresh = self.target.connect(&db).await?;
+                        let spid = text_rows(&mut fresh, "SELECT CAST(@@SPID AS int)", &[]).await?.first().and_then(|r| r[0].clone()).unwrap_or_default();
+                        *self.spid.lock() = spid;
+                        *self.database.lock() = db.clone();
+                        *slot = Some(fresh);
+                        self.suspect.store(false, std::sync::atomic::Ordering::Relaxed);
+                        return Ok(StatementOutcome::Done(format!("Switched to database {db} (new session)")));
                     }
                 }
                 if r.is_ok()
@@ -877,6 +926,7 @@ impl SqlConsole for MsConsole {
 
     fn cancel(&self) {
         // SQL Server has no per-request cancel statement; end the session.
+        self.cancel_requested.store(true, std::sync::atomic::Ordering::SeqCst);
         let spid = self.spid.lock().clone();
         let target = self.target.clone();
         self.rt.spawn(async move {
@@ -894,6 +944,19 @@ impl SqlConsole for MsConsole {
 
     async fn close(&self) {
         *self.conn.lock().await = None;
+    }
+}
+
+#[cfg(test)]
+mod use_tests {
+    #[test]
+    fn parses_use_targets() {
+        assert_eq!(super::use_target("USE [volza-www];").as_deref(), Some("volza-www"));
+        assert_eq!(super::use_target("  use shop ").as_deref(), Some("shop"));
+        assert_eq!(super::use_target("USE \"odd name\"").as_deref(), Some("odd name"));
+        assert_eq!(super::use_target("USE [a]]b]").as_deref(), Some("a]b"));
+        assert_eq!(super::use_target("USER_NAME()"), None);
+        assert_eq!(super::use_target("USE a b"), None);
     }
 }
 

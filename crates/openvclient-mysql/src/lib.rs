@@ -77,6 +77,8 @@ impl MyTarget {
             .prefer_socket(false)
             // Count matched rows on UPDATE so "row not found" can be detected.
             .client_found_rows(true)
+            // Keep long, silent statements from being dropped by idle firewalls/NAT.
+            .tcp_keepalive(Some(Duration::from_secs(30)))
             .stmt_cache_size(32);
         if pooled {
             b = b.pool_opts(PoolOpts::default().with_constraints(PoolConstraints::new(0, 4).expect("valid constraints")));

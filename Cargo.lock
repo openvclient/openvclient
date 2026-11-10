@@ -4557,7 +4557,7 @@ dependencies = [
 
 [[package]]
 name = "openvclient-app"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.6"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -4602,7 +4602,7 @@ dependencies = [
 
 [[package]]
 name = "openvclient-core"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4619,7 +4619,7 @@ dependencies = [
 
 [[package]]
 name = "openvclient-docker"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.6"
 dependencies = [
  "async-trait",
  "bollard",
@@ -4633,7 +4633,7 @@ dependencies = [
 
 [[package]]
 name = "openvclient-http"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.6"
 dependencies = [
  "async-trait",
  "openvclient-core",
@@ -4645,7 +4645,7 @@ dependencies = [
 
 [[package]]
 name = "openvclient-mongo"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.6"
 dependencies = [
  "async-trait",
  "futures",
@@ -4657,7 +4657,7 @@ dependencies = [
 
 [[package]]
 name = "openvclient-mysql"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.6"
 dependencies = [
  "async-trait",
  "futures",
@@ -4670,7 +4670,7 @@ dependencies = [
 
 [[package]]
 name = "openvclient-net"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.6"
 dependencies = [
  "base64 0.23.1",
  "openvclient-core",
@@ -4684,7 +4684,7 @@ dependencies = [
 
 [[package]]
 name = "openvclient-postgres"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.6"
 dependencies = [
  "async-trait",
  "deadpool-postgres",
@@ -4701,7 +4701,7 @@ dependencies = [
 
 [[package]]
 name = "openvclient-redis"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.6"
 dependencies = [
  "async-trait",
  "openvclient-core",
@@ -4711,7 +4711,7 @@ dependencies = [
 
 [[package]]
 name = "openvclient-sqlite"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.6"
 dependencies = [
  "async-trait",
  "openvclient-core",
@@ -4722,7 +4722,7 @@ dependencies = [
 
 [[package]]
 name = "openvclient-sqlserver"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.6"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4732,6 +4732,7 @@ dependencies = [
  "parking_lot 0.13.0",
  "reqwest",
  "serde_json",
+ "socket2",
  "tiberius",
  "tokio",
  "tokio-util",
@@ -4740,7 +4741,7 @@ dependencies = [
 
 [[package]]
 name = "openvclient-storage"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.6"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
